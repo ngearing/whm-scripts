@@ -1,5 +1,7 @@
 import https from 'https';
 import dotenv from 'dotenv';
+import { getPHP } from './getPHP';
+import { setPHP } from './setPHP';
 
 // ==========================================
 // 1. CONFIGURATION CONFIG SETTINGS
@@ -7,9 +9,9 @@ import dotenv from 'dotenv';
 
 // Load environment variables if you prefer (uncomment below and set in .env file)
 dotenv.config();
-const WHM_URL = process.env.WHM_URL;
-const WHM_USER = process.env.USER;
-const API_TOKEN = process.env.API_TOKEN;
+const WHM_URL = process.env.whm_url;
+const WHM_USER = process.env.whm_user;
+const API_TOKEN = process.env.api_token;
 
 const headers = {
     'Authorization': `whm ${WHM_USER}:${API_TOKEN}`,
@@ -44,35 +46,19 @@ async function runAutomation() {
             const username = account.user;
             const domain = account.domain;
 
-            // Targeting cPanel's LangPHP module
-            const uapiUrl = `${WHM_URL}/json-api/uapi?api.version=1&user=${username}&module=LangPHP&function=php_get_vhost_versions`;
+            let phpVersion = getPHP(username, domain);
 
-            try {
-                const uapiResponse = await fetch(uapiUrl, { headers, agent });
-                const uapiData = await uapiResponse.json();
+            const oldVersions = ['ea-php56', 'ea-php70', 'ea-php71', 'ea-php72', 'ea-php73', 'ea-php74', 'ea-php80', 'ea-php81', 'ea-php82'];
+            const targetVersion = 'ea-php83'; // The version you want to upgrade to
 
-                // EXTRACTING THE SYSTEM VERSION ARRAY
-                const vhostList = uapiData?.result?.data?.vhosts || [];
-                let phpVersion = 'Not Defined';
+            if (oldVersions.includes(phpVersion)) {
+                console.log(`--> ${username} is using an outdated PHP version (${phpVersion}). Attemping upgrade to ${targetVersion}.`);
 
-                // Look through the server array to extract the record matching the primary domain
-                if (Array.isArray(vhostList)) {
-                    const primaryVhost = vhostList.find(v => v.vhost === domain);
-                    if (primaryVhost) {
-                        phpVersion = primaryVhost.version;
-                    } else if (vhostList.length > 0) {
-                        // Fallback: grab the first configuration version found on the profile
-                        phpVersion = vhostList[0].version;
-                    }
-                }
-
-                console.log(`${username.padEnd(15)} | ${domain.padEnd(35)} | ${phpVersion}`);
-            } catch (err) {
-                console.log(`${username.padEnd(15)} | ${domain.padEnd(35)} | ERROR: ${err.message}`);
+                await setPHP(username, domain, targetVersion);
             }
         }
-
-    } catch (error) {
+    }
+    catch (error) {
         console.error('Master script critical connection error:', error.message);
     }
 }
