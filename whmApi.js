@@ -116,7 +116,7 @@ export async function getExtensions({ WHM_URL, headers, agent }, username, domai
     console.log('RAW EXTENSIONS:', JSON.stringify(data, null, 2));
 }
 
-async function createUserSession(username, { WHM_URL, headers, agent }) {
+export async function createUserSession(username, { WHM_URL, headers, agent }) {
     const url = `${WHM_URL}/json-api/create_user_session?api.version=1`
         + `&user=${username}`
         + `&service=cpaneld`;
@@ -127,7 +127,7 @@ async function createUserSession(username, { WHM_URL, headers, agent }) {
     return data?.data?.url; // Returns a one-time login URL with a session token
 }
 
-async function callCpanelUAPI({ WHM_URL, headers, agent }, sessionUrl, module, func, params = {}) {
+export async function callCpanelUAPI({ WHM_URL, headers, agent }, sessionUrl, module, func, params = {}) {
     // Use cached session or init a new one
     const session = cachedSession || await initSession(sessionUrl);
     const { cpanelBase, sessionToken, cpsession } = session;
@@ -204,7 +204,7 @@ async function probeModules(sessionUrl, config) {
 // Store session data once, reuse across calls
 let cachedSession = null;
 
-async function initSession(sessionUrl, { WHM_URL, headers, agent }) {
+export async function initSession(sessionUrl, { WHM_URL, headers, agent }) {
     const urlObj = new URL(sessionUrl);
     const cpanelBase = `${urlObj.protocol}//${urlObj.host}`;
     const sessionToken = urlObj.pathname.split('/').find(p => p.startsWith('cpsess'));
