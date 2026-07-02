@@ -30,7 +30,6 @@ export async function getPHP({ WHM_URL, headers, agent }, username, domain) {
         }
     }
 
-    console.log(`${username.padEnd(15)} | ${domain.padEnd(35)} | ${phpVersion}`);
     return phpVersion;
 }
 

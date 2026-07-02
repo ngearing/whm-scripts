@@ -13,7 +13,7 @@ async function runAutomation() {
         }
 
         console.log(`Found ${accounts.length} accounts. Starting PHP version lookup...\n`);
-        console.log(`${'USER'.padEnd(15)} | ${'PRIMARY DOMAIN'.padEnd(35)} | ${'PHP VERSION'}`);
+        console.log(`${'USER'.padEnd(15)} | ${'PRIMARY DOMAIN'.padEnd(35)} | HTTP STATUS | ${'PHP VERSION'}`);
         console.log('-'.repeat(70));
 
         // Loop through each account sequentially
@@ -21,7 +21,19 @@ async function runAutomation() {
             const username = account.user;
             const domain = account.domain;
 
+            // Check website for HTTP/PHP errors by sending a HEAD request to the domain.
+            let httpStatus = 'Unknown';
+            await fetch(`https://${domain}`, { method: 'HEAD' })
+                .then(response => {
+                    httpStatus = response.status;
+                })
+                .catch(error => {
+                    httpStatus = 'Error';
+                });
+
             let phpVersion = await getPHP(config, username, domain);
+
+            console.log(`${username.padEnd(15)} | ${domain.padEnd(35)} | ${httpStatus} | ${phpVersion}`);
 
             const oldVersions = ['ea-php56', 'ea-php70', 'ea-php71', 'ea-php72', 'ea-php73', 'ea-php74', 'ea-php80', 'ea-php81', 'ea-php82', 'alt-php85'];
             const targetVersion = 'ea-php83'; // The version you want to upgrade to
