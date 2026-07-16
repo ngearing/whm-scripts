@@ -5,8 +5,11 @@
  *
  * Pulls the full list of cPanel accounts from your Shock Hosting WHM
  * reseller account (whmapi1 `listaccts`), plus the PHP version assigned to
- * each vhost (whmapi1 `php_get_vhost_versions`), and stores both into the
- * same local SQLite database used by sync_synergy_domains.php.
+ * each vhost - fetched per-account via the `uapi_cpanel` proxy running the
+ * LangPHP::php_get_vhost_versions UAPI function as that cPanel user, since
+ * reseller ACLs typically don't grant the top-level whmapi1 PHP functions.
+ * Both are stored into the same local SQLite database used by
+ * sync_synergy_domains.php.
  *
  * This is step 2 of the reconciliation pipeline: "Pull domains from Shock
  * and match up cPanel installs". Once both sync scripts have run, a third
@@ -21,7 +24,7 @@
  *   - PHP PDO SQLite extension (also bundled)
  *   - A WHM API token generated under WHM -> Development -> Manage API
  *     Tokens on your Shock reseller account, scoped at minimum to the
- *     `listaccts` and `php_get_vhost_versions` ACLs (or full access)
+ *     `listaccts` and `uapi_cpanel` ACLs (or full access)
  */
 
 // ---------------------------------------------------------------------
@@ -142,7 +145,7 @@ function whm_api_call(string $function, array $params = []): array {
 // ---------------------------------------------------------------------
 // SYNC: ACCOUNTS
 // ---------------------------------------------------------------------
-function sync_whm_accounts(PDO $pdo, string $syncedAt): int {
+function sync_whm_accounts(PDO $pdo, string $syncedAt): array {
     echo "Fetching cPanel account list (listaccts)...\n";
 
     $response = whm_api_call('listaccts');
@@ -190,28 +193,47 @@ function sync_whm_accounts(PDO $pdo, string $syncedAt): int {
     }
     $pdo->commit();
 
-    return count($accounts);
+    return $accounts;
 }
 
 // ---------------------------------------------------------------------
 // SYNC: PHP VERSIONS PER VHOST
 // ---------------------------------------------------------------------
-function sync_php_versions(PDO $pdo, string $syncedAt): int {
-    echo "Fetching PHP version per vhost (php_get_vhost_versions)...\n";
+/**
+ * On reseller-scoped WHM accounts (like Shock's reseller plans), the
+ * top-level `whmapi1 php_get_vhost_versions` function is often outside the
+ * reseller's ACL. The reliable path is to proxy a UAPI call through WHM as
+ * the specific cPanel user via the `uapi_cpanel` function - this borrows
+ * that cPanel user's own permissions instead of requiring reseller-level
+ * PHP management rights. This mirrors the working Node.js implementation.
+ *
+ * Because this call is scoped to one cPanel user at a time, it has to run
+ * once per account rather than as a single bulk call - expect this to take
+ * a while longer at 400+ accounts (roughly one HTTP round trip per site).
+ */
+function get_php_versions_for_account(string $username, string $primaryDomain): array {
+    $params = [
+        'cpanel.user'     => $username,
+        'cpanel.module'   => 'LangPHP',
+        'cpanel.function' => 'php_get_vhost_versions',
+    ];
 
-    $response = whm_api_call('php_get_vhost_versions');
+    $response = whm_api_call('uapi_cpanel', $params);
 
-    $result = $response['metadata']['result'] ?? 0;
-    if ($result != 1) {
-        $reason = $response['metadata']['reason'] ?? 'Unknown error';
-        // Non-fatal: some reseller ACLs don't include this function. Log
-        // and continue rather than aborting the whole sync.
-        fwrite(STDERR, "php_get_vhost_versions failed (skipping PHP version sync): {$reason}\n");
-        return 0;
+    $vhostList = $response['data']['uapi']['data'] ?? [];
+    if (!is_array($vhostList)) {
+        $vhostList = [];
     }
 
-    $versions = $response['data']['versions'] ?? [];
-    echo "Received PHP version data for " . count($versions) . " vhosts.\n";
+    return $vhostList; // array of ['vhost' => ..., 'version' => ...]
+}
+
+/**
+ * @param array $accounts The account rows returned from listaccts (needs
+ *                         'user' and 'domain' keys per entry)
+ */
+function sync_php_versions(PDO $pdo, string $syncedAt, array $accounts): int {
+    echo "Fetching PHP version per account via uapi_cpanel (this loops one call per account)...\n";
 
     $upsertVhost = $pdo->prepare("
         INSERT INTO whm_vhost_php_versions (vhost, account, php_version, last_synced_at)
@@ -222,39 +244,84 @@ function sync_php_versions(PDO $pdo, string $syncedAt): int {
             last_synced_at  = excluded.last_synced_at
     ");
 
-    // Also roll the primary domain's PHP version up onto whm_accounts for
-    // convenient querying without a join, when the vhost matches the
-    // account's main domain.
     $updateAcctPhp = $pdo->prepare("
         UPDATE whm_accounts SET php_version = :php_version
-        WHERE domain = :domain
+        WHERE username = :username
     ");
 
-    $pdo->beginTransaction();
-    foreach ($versions as $v) {
-        $vhost = $v['vhost'] ?? null;
-        $account = $v['account'] ?? null;
-        $version = $v['version'] ?? null;
+    $totalVhosts = 0;
+    $errorCount = 0;
+    $i = 0;
 
-        if ($vhost === null) {
+    foreach ($accounts as $acct) {
+        $i++;
+        $username = $acct['user'] ?? null;
+        $domain = $acct['domain'] ?? null;
+
+        if ($username === null || $domain === null) {
             continue;
         }
 
-        $upsertVhost->execute([
-            ':vhost'          => $vhost,
-            ':account'        => $account,
-            ':php_version'    => $version,
-            ':last_synced_at' => $syncedAt,
-        ]);
+        try {
+            $vhostList = get_php_versions_for_account($username, $domain);
+        } catch (Throwable $e) {
+            fwrite(STDERR, "  [{$username}] PHP version lookup failed: " . $e->getMessage() . "\n");
+            $errorCount++;
+            continue;
+        }
+
+        // Match the primary domain's vhost entry; fall back to the first
+        // entry if there's no exact match (mirrors the Node.js logic).
+        $primaryVersion = 'Not Defined';
+        $primaryVhostEntry = null;
+        foreach ($vhostList as $v) {
+            if (($v['vhost'] ?? null) === $domain) {
+                $primaryVhostEntry = $v;
+                break;
+            }
+        }
+        if ($primaryVhostEntry === null && count($vhostList) > 0) {
+            $primaryVhostEntry = $vhostList[0];
+        }
+        if ($primaryVhostEntry !== null) {
+            $primaryVersion = $primaryVhostEntry['version'] ?? 'Not Defined';
+        }
+
+        $pdo->beginTransaction();
+        foreach ($vhostList as $v) {
+            $vhost = $v['vhost'] ?? null;
+            $version = $v['version'] ?? null;
+            if ($vhost === null) {
+                continue;
+            }
+
+            $upsertVhost->execute([
+                ':vhost'          => $vhost,
+                ':account'        => $username,
+                ':php_version'    => $version,
+                ':last_synced_at' => $syncedAt,
+            ]);
+            $totalVhosts++;
+        }
 
         $updateAcctPhp->execute([
-            ':php_version' => $version,
-            ':domain'      => $vhost,
+            ':php_version' => $primaryVersion,
+            ':username'    => $username,
         ]);
-    }
-    $pdo->commit();
+        $pdo->commit();
 
-    return count($versions);
+        if ($i % 25 === 0) {
+            echo "  ...processed {$i}/" . count($accounts) . " accounts\n";
+        }
+
+        // Be polite to the API - 400+ sequential calls without a pause can
+        // trip rate limiting on shared reseller infrastructure.
+        usleep(150000); // 0.15s
+    }
+
+    echo "PHP version sync complete. {$totalVhosts} vhost records synced, {$errorCount} accounts failed lookup.\n";
+
+    return $totalVhosts;
 }
 
 // ---------------------------------------------------------------------
@@ -264,11 +331,11 @@ try {
     $pdo = get_db();
     $syncedAt = date('c');
 
-    $acctCount = sync_whm_accounts($pdo, $syncedAt);
-    $phpCount = sync_php_versions($pdo, $syncedAt);
+    $accounts = sync_whm_accounts($pdo, $syncedAt);
+    $phpCount = sync_php_versions($pdo, $syncedAt, $accounts);
 
     echo "\nDone.\n";
-    echo "  Accounts synced: {$acctCount}\n";
+    echo "  Accounts synced: " . count($accounts) . "\n";
     echo "  PHP version records synced: {$phpCount}\n";
     echo "Data stored in " . DB_PATH . " (tables: whm_accounts, whm_vhost_php_versions)\n";
 } catch (Throwable $e) {
