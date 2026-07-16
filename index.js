@@ -35,7 +35,7 @@ async function runAutomation() {
 
             console.log(`${username.padEnd(15)} | ${domain.padEnd(35)} | ${httpStatus} | ${phpVersion}`);
 
-            const oldVersions = ['ea-php56', 'ea-php70', 'ea-php71', 'ea-php72', 'ea-php73', 'ea-php74', 'ea-php80', 'ea-php81', 'ea-php82', 'alt-php85'];
+            const oldVersions = ['ea-php56', 'ea-php70', 'ea-php71', 'ea-php72', 'ea-php73', 'ea-php74', 'ea-php80', 'ea-php81', 'ea-php82', 'ea-php85', 'alt-php85'];
             const targetVersion = 'ea-php83'; // The version you want to upgrade to
 
             if (oldVersions.includes(phpVersion)) {
