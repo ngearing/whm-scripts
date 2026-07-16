@@ -4,11 +4,12 @@
  * sync_whm_accounts.php
  *
  * Pulls the full list of cPanel accounts from your Shock Hosting WHM
- * reseller account (whmapi1 `listaccts`), plus the PHP version assigned to
- * each vhost - fetched per-account via the `uapi_cpanel` proxy running the
- * LangPHP::php_get_vhost_versions UAPI function as that cPanel user, since
- * reseller ACLs typically don't grant the top-level whmapi1 PHP functions.
- * Both are stored into the same local SQLite database used by
+ * reseller account (whmapi1 `listaccts`), plus - per account, via the
+ * `uapi_cpanel` proxy running UAPI functions as that cPanel user (since
+ * reseller ACLs typically don't grant the top-level whmapi1 equivalents) -
+ * the PHP version per vhost (LangPHP::php_get_vhost_versions) and the full
+ * domain inventory: main, addon, and parked domains (DomainInfo::list_domains).
+ * All three are stored into the same local SQLite database used by
  * sync_synergy_domains.php.
  *
  * This is step 2 of the reconciliation pipeline: "Pull domains from Shock
@@ -79,6 +80,19 @@ function get_db(): PDO {
             vhost            TEXT PRIMARY KEY,
             account          TEXT,
             php_version      TEXT,
+            last_synced_at   TEXT
+        )
+    ");
+
+    // listaccts only returns each account's primary domain. This table
+    // captures the FULL domain inventory per account (main, addon, parked)
+    // via DomainInfo::list_domains, which is what lets us match Synergy
+    // domains against addon/parked domains, not just primary installs.
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS whm_domains (
+            domain           TEXT PRIMARY KEY,
+            account          TEXT,
+            domain_type      TEXT,   -- 'main', 'addon', or 'parked'
             last_synced_at   TEXT
         )
     ");
@@ -229,11 +243,39 @@ function get_php_versions_for_account(string $username, string $primaryDomain): 
 }
 
 /**
+ * Fetches the full domain inventory (main, addon, parked) for one cPanel
+ * account via DomainInfo::list_domains, proxied through uapi_cpanel the
+ * same way as the PHP version lookup above.
+ *
+ * @return array{main: ?string, addon: string[], parked: string[]}
+ */
+function get_domains_for_account(string $username): array {
+    $params = [
+        'cpanel.user'     => $username,
+        'cpanel.module'   => 'DomainInfo',
+        'cpanel.function' => 'list_domains',
+    ];
+
+    $response = whm_api_call('uapi_cpanel', $params);
+    $data = $response['data']['uapi']['data'] ?? [];
+
+    $addon = $data['addon_domains'] ?? [];
+    $parked = $data['parked_domains'] ?? [];
+
+    return [
+        'main'   => $data['main_domain'] ?? null,
+        'addon'  => is_array($addon) ? $addon : [],
+        'parked' => is_array($parked) ? $parked : [],
+    ];
+}
+
+/**
  * @param array $accounts The account rows returned from listaccts (needs
  *                         'user' and 'domain' keys per entry)
  */
-function sync_php_versions(PDO $pdo, string $syncedAt, array $accounts): int {
-    echo "Fetching PHP version per account via uapi_cpanel (this loops one call per account)...\n";
+function sync_account_details(PDO $pdo, string $syncedAt, array $accounts): array {
+    echo "Fetching PHP versions and full domain inventory per account (uapi_cpanel)...\n";
+    echo "This loops two calls per account, so it's the slowest step - grab a coffee.\n";
 
     $upsertVhost = $pdo->prepare("
         INSERT INTO whm_vhost_php_versions (vhost, account, php_version, last_synced_at)
@@ -249,7 +291,17 @@ function sync_php_versions(PDO $pdo, string $syncedAt, array $accounts): int {
         WHERE username = :username
     ");
 
+    $upsertDomain = $pdo->prepare("
+        INSERT INTO whm_domains (domain, account, domain_type, last_synced_at)
+        VALUES (:domain, :account, :domain_type, :last_synced_at)
+        ON CONFLICT(domain) DO UPDATE SET
+            account         = excluded.account,
+            domain_type     = excluded.domain_type,
+            last_synced_at  = excluded.last_synced_at
+    ");
+
     $totalVhosts = 0;
+    $totalDomains = 0;
     $errorCount = 0;
     $i = 0;
 
@@ -262,16 +314,15 @@ function sync_php_versions(PDO $pdo, string $syncedAt, array $accounts): int {
             continue;
         }
 
+        // --- PHP versions ---
         try {
             $vhostList = get_php_versions_for_account($username, $domain);
         } catch (Throwable $e) {
             fwrite(STDERR, "  [{$username}] PHP version lookup failed: " . $e->getMessage() . "\n");
+            $vhostList = [];
             $errorCount++;
-            continue;
         }
 
-        // Match the primary domain's vhost entry; fall back to the first
-        // entry if there's no exact match (mirrors the Node.js logic).
         $primaryVersion = 'Not Defined';
         $primaryVhostEntry = null;
         foreach ($vhostList as $v) {
@@ -287,14 +338,23 @@ function sync_php_versions(PDO $pdo, string $syncedAt, array $accounts): int {
             $primaryVersion = $primaryVhostEntry['version'] ?? 'Not Defined';
         }
 
+        // --- Domain inventory (main / addon / parked) ---
+        try {
+            $domainInfo = get_domains_for_account($username);
+        } catch (Throwable $e) {
+            fwrite(STDERR, "  [{$username}] Domain list lookup failed: " . $e->getMessage() . "\n");
+            $domainInfo = ['main' => $domain, 'addon' => [], 'parked' => []];
+            $errorCount++;
+        }
+
         $pdo->beginTransaction();
+
         foreach ($vhostList as $v) {
             $vhost = $v['vhost'] ?? null;
             $version = $v['version'] ?? null;
             if ($vhost === null) {
                 continue;
             }
-
             $upsertVhost->execute([
                 ':vhost'          => $vhost,
                 ':account'        => $username,
@@ -308,20 +368,51 @@ function sync_php_versions(PDO $pdo, string $syncedAt, array $accounts): int {
             ':php_version' => $primaryVersion,
             ':username'    => $username,
         ]);
+
+        $mainDomain = $domainInfo['main'] ?? $domain;
+        if ($mainDomain) {
+            $upsertDomain->execute([
+                ':domain'         => $mainDomain,
+                ':account'        => $username,
+                ':domain_type'    => 'main',
+                ':last_synced_at' => $syncedAt,
+            ]);
+            $totalDomains++;
+        }
+        foreach ($domainInfo['addon'] as $addonDomain) {
+            $upsertDomain->execute([
+                ':domain'         => $addonDomain,
+                ':account'        => $username,
+                ':domain_type'    => 'addon',
+                ':last_synced_at' => $syncedAt,
+            ]);
+            $totalDomains++;
+        }
+        foreach ($domainInfo['parked'] as $parkedDomain) {
+            $upsertDomain->execute([
+                ':domain'         => $parkedDomain,
+                ':account'        => $username,
+                ':domain_type'    => 'parked',
+                ':last_synced_at' => $syncedAt,
+            ]);
+            $totalDomains++;
+        }
+
         $pdo->commit();
 
         if ($i % 25 === 0) {
             echo "  ...processed {$i}/" . count($accounts) . " accounts\n";
         }
 
-        // Be polite to the API - 400+ sequential calls without a pause can
-        // trip rate limiting on shared reseller infrastructure.
+        // Be polite to the API - hundreds of sequential calls without a
+        // pause can trip rate limiting on shared reseller infrastructure.
         usleep(150000); // 0.15s
     }
 
-    echo "PHP version sync complete. {$totalVhosts} vhost records synced, {$errorCount} accounts failed lookup.\n";
+    echo "Account detail sync complete. {$totalVhosts} vhost PHP records, "
+        . "{$totalDomains} domain records (main+addon+parked), {$errorCount} lookups failed.\n";
 
-    return $totalVhosts;
+    return ['vhosts' => $totalVhosts, 'domains' => $totalDomains, 'errors' => $errorCount];
 }
 
 // ---------------------------------------------------------------------
@@ -332,12 +423,13 @@ try {
     $syncedAt = date('c');
 
     $accounts = sync_whm_accounts($pdo, $syncedAt);
-    $phpCount = sync_php_versions($pdo, $syncedAt, $accounts);
+    $details = sync_account_details($pdo, $syncedAt, $accounts);
 
     echo "\nDone.\n";
     echo "  Accounts synced: " . count($accounts) . "\n";
-    echo "  PHP version records synced: {$phpCount}\n";
-    echo "Data stored in " . DB_PATH . " (tables: whm_accounts, whm_vhost_php_versions)\n";
+    echo "  PHP version records synced: {$details['vhosts']}\n";
+    echo "  Domain records synced (main+addon+parked): {$details['domains']}\n";
+    echo "Data stored in " . DB_PATH . " (tables: whm_accounts, whm_vhost_php_versions, whm_domains)\n";
 } catch (Throwable $e) {
     fwrite(STDERR, "Error: " . $e->getMessage() . "\n");
     exit(1);
