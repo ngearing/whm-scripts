@@ -18,7 +18,14 @@
  * orphans in either direction.
  *
  * Usage:
- *   php sync_whm_accounts.php
+ *   WHM_SOURCE_LABEL=shock-1 WHM_HOST=... WHM_USERNAME=... WHM_API_TOKEN=... php sync_whm_accounts.php
+ *   WHM_SOURCE_LABEL=shock-2 WHM_HOST=... WHM_USERNAME=... WHM_API_TOKEN=... php sync_whm_accounts.php
+ *
+ * Run it once per Shock reseller account, each time with a distinct
+ * WHM_SOURCE_LABEL. Every row is tagged with that label, and each run only
+ * clears/rebuilds its own source's rows - so syncing account 2 never
+ * touches account 1's data, even if both happen to reuse the same cPanel
+ * username somewhere.
  *
  * Requires:
  *   - PHP cURL extension (bundled with Homebrew's php formula)
@@ -47,19 +54,70 @@ define('WHM_USERNAME', getenv('WHM_USERNAME') ?: 'YOUR_WHM_USERNAME');
 
 define('WHM_API_TOKEN', getenv('WHM_API_TOKEN') ?: 'YOUR_API_TOKEN');
 
+// You have more than one Shock reseller account (too many cPanels to fit
+// under one), so every record needs to be tagged with which account it
+// came from - otherwise a username that happens to exist on both accounts
+// would silently overwrite the other's data on re-sync.
+//
+// Set this explicitly per run, e.g. WHM_SOURCE_LABEL=shock-1 and
+// WHM_SOURCE_LABEL=shock-2. If left unset it falls back to
+// "host:username", which is unique enough by default but a plain label is
+// easier to read in reports.
+define('WHM_SOURCE_LABEL', getenv('WHM_SOURCE_LABEL') ?: (WHM_HOST . ':' . WHM_USERNAME));
+
 // Same DB file the Synergy sync writes to, so both tables live together.
 define('DB_PATH', __DIR__ . '/websites.sqlite');
 
 // ---------------------------------------------------------------------
 // DB SETUP
 // ---------------------------------------------------------------------
+/**
+ * If you ran an earlier version of this script before multi-account
+ * support existed, whm_accounts/whm_vhost_php_versions/whm_domains won't
+ * have a whm_source column yet. Since these tables are just a synced cache
+ * (fully rebuilt by re-running the sync scripts), the simplest safe fix is
+ * to drop and let them get recreated with the new schema, rather than
+ * attempting a fragile in-place ALTER. This only touches the three WHM
+ * tables - synergy_domains and any reconciliation output are untouched.
+ */
+function migrate_legacy_schema(PDO $pdo): void {
+    $tables = ['whm_accounts', 'whm_vhost_php_versions', 'whm_domains'];
+
+    foreach ($tables as $table) {
+        $exists = $pdo->query("
+            SELECT name FROM sqlite_master WHERE type='table' AND name='{$table}'
+        ")->fetchColumn();
+
+        if (!$exists) {
+            continue;
+        }
+
+        $columns = $pdo->query("PRAGMA table_info({$table})")->fetchAll(PDO::FETCH_ASSOC);
+        $hasSourceColumn = false;
+        foreach ($columns as $col) {
+            if ($col['name'] === 'whm_source') {
+                $hasSourceColumn = true;
+                break;
+            }
+        }
+
+        if (!$hasSourceColumn) {
+            echo "Migrating {$table} to multi-account schema (old data will be re-synced fresh)...\n";
+            $pdo->exec("DROP TABLE {$table}");
+        }
+    }
+}
+
 function get_db(): PDO {
     $pdo = new PDO('sqlite:' . DB_PATH);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
+    migrate_legacy_schema($pdo);
+
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS whm_accounts (
-            username         TEXT PRIMARY KEY,
+            username         TEXT,
+            whm_source       TEXT,
             domain           TEXT,
             plan             TEXT,
             ip               TEXT,
@@ -68,7 +126,8 @@ function get_db(): PDO {
             suspended         INTEGER,
             suspend_reason    TEXT,
             php_version       TEXT,
-            last_synced_at    TEXT
+            last_synced_at    TEXT,
+            PRIMARY KEY (username, whm_source)
         )
     ");
 
@@ -77,10 +136,12 @@ function get_db(): PDO {
     // running a different PHP version.
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS whm_vhost_php_versions (
-            vhost            TEXT PRIMARY KEY,
+            vhost            TEXT,
+            whm_source       TEXT,
             account          TEXT,
             php_version      TEXT,
-            last_synced_at   TEXT
+            last_synced_at   TEXT,
+            PRIMARY KEY (vhost, whm_source)
         )
     ");
 
@@ -88,16 +149,39 @@ function get_db(): PDO {
     // captures the FULL domain inventory per account (main, addon, parked)
     // via DomainInfo::list_domains, which is what lets us match Synergy
     // domains against addon/parked domains, not just primary installs.
+    //
+    // Note: domain is intentionally NOT unique on its own here - the same
+    // domain string showing up under two different whm_source values would
+    // mean the exact same domain is hosted on both reseller accounts,
+    // which is itself worth surfacing as a data problem rather than
+    // silently picking a winner. reconcile_domains.php flags this case.
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS whm_domains (
-            domain           TEXT PRIMARY KEY,
+            domain           TEXT,
+            whm_source       TEXT,
             account          TEXT,
             domain_type      TEXT,   -- 'main', 'addon', or 'parked'
-            last_synced_at   TEXT
+            last_synced_at   TEXT,
+            PRIMARY KEY (domain, whm_source)
         )
     ");
 
     return $pdo;
+}
+
+/**
+ * Wipes only this WHM source's prior rows from all three tables, so a
+ * re-sync of one reseller account never touches the other's data and
+ * correctly drops accounts/domains that were removed since the last sync
+ * of THIS source.
+ */
+function clear_existing_source_data(PDO $pdo, string $source): void {
+    $pdo->prepare("DELETE FROM whm_accounts WHERE whm_source = :source")
+        ->execute([':source' => $source]);
+    $pdo->prepare("DELETE FROM whm_vhost_php_versions WHERE whm_source = :source")
+        ->execute([':source' => $source]);
+    $pdo->prepare("DELETE FROM whm_domains WHERE whm_source = :source")
+        ->execute([':source' => $source]);
 }
 
 // ---------------------------------------------------------------------
@@ -160,7 +244,7 @@ function whm_api_call(string $function, array $params = []): array {
 // SYNC: ACCOUNTS
 // ---------------------------------------------------------------------
 function sync_whm_accounts(PDO $pdo, string $syncedAt): array {
-    echo "Fetching cPanel account list (listaccts)...\n";
+    echo "Fetching cPanel account list (listaccts) for source '" . WHM_SOURCE_LABEL . "'...\n";
 
     $response = whm_api_call('listaccts');
 
@@ -173,28 +257,24 @@ function sync_whm_accounts(PDO $pdo, string $syncedAt): array {
     $accounts = $response['data']['acct'] ?? [];
     echo "Received " . count($accounts) . " accounts.\n";
 
-    $upsert = $pdo->prepare("
+    // Only clear this source's own prior rows - the other reseller
+    // account's data (if already synced) is untouched.
+    clear_existing_source_data($pdo, WHM_SOURCE_LABEL);
+
+    $insert = $pdo->prepare("
         INSERT INTO whm_accounts
-            (username, domain, plan, ip, disklimit, diskused,
+            (username, whm_source, domain, plan, ip, disklimit, diskused,
              suspended, suspend_reason, last_synced_at)
         VALUES
-            (:username, :domain, :plan, :ip, :disklimit, :diskused,
+            (:username, :whm_source, :domain, :plan, :ip, :disklimit, :diskused,
              :suspended, :suspend_reason, :last_synced_at)
-        ON CONFLICT(username) DO UPDATE SET
-            domain          = excluded.domain,
-            plan            = excluded.plan,
-            ip              = excluded.ip,
-            disklimit       = excluded.disklimit,
-            diskused        = excluded.diskused,
-            suspended       = excluded.suspended,
-            suspend_reason  = excluded.suspend_reason,
-            last_synced_at  = excluded.last_synced_at
     ");
 
     $pdo->beginTransaction();
     foreach ($accounts as $acct) {
-        $upsert->execute([
+        $insert->execute([
             ':username'       => $acct['user'] ?? null,
+            ':whm_source'     => WHM_SOURCE_LABEL,
             ':domain'         => $acct['domain'] ?? null,
             ':plan'           => $acct['plan'] ?? null,
             ':ip'             => $acct['ip'] ?? null,
@@ -277,27 +357,19 @@ function sync_account_details(PDO $pdo, string $syncedAt, array $accounts): arra
     echo "Fetching PHP versions and full domain inventory per account (uapi_cpanel)...\n";
     echo "This loops two calls per account, so it's the slowest step - grab a coffee.\n";
 
-    $upsertVhost = $pdo->prepare("
-        INSERT INTO whm_vhost_php_versions (vhost, account, php_version, last_synced_at)
-        VALUES (:vhost, :account, :php_version, :last_synced_at)
-        ON CONFLICT(vhost) DO UPDATE SET
-            account         = excluded.account,
-            php_version     = excluded.php_version,
-            last_synced_at  = excluded.last_synced_at
+    $insertVhost = $pdo->prepare("
+        INSERT INTO whm_vhost_php_versions (vhost, whm_source, account, php_version, last_synced_at)
+        VALUES (:vhost, :whm_source, :account, :php_version, :last_synced_at)
     ");
 
     $updateAcctPhp = $pdo->prepare("
         UPDATE whm_accounts SET php_version = :php_version
-        WHERE username = :username
+        WHERE username = :username AND whm_source = :whm_source
     ");
 
-    $upsertDomain = $pdo->prepare("
-        INSERT INTO whm_domains (domain, account, domain_type, last_synced_at)
-        VALUES (:domain, :account, :domain_type, :last_synced_at)
-        ON CONFLICT(domain) DO UPDATE SET
-            account         = excluded.account,
-            domain_type     = excluded.domain_type,
-            last_synced_at  = excluded.last_synced_at
+    $insertDomain = $pdo->prepare("
+        INSERT INTO whm_domains (domain, whm_source, account, domain_type, last_synced_at)
+        VALUES (:domain, :whm_source, :account, :domain_type, :last_synced_at)
     ");
 
     $totalVhosts = 0;
@@ -355,47 +427,55 @@ function sync_account_details(PDO $pdo, string $syncedAt, array $accounts): arra
             if ($vhost === null) {
                 continue;
             }
-            $upsertVhost->execute([
-                ':vhost'          => $vhost,
-                ':account'        => $username,
-                ':php_version'    => $version,
-                ':last_synced_at' => $syncedAt,
-            ]);
-            $totalVhosts++;
+            try {
+                $insertVhost->execute([
+                    ':vhost'          => $vhost,
+                    ':whm_source'     => WHM_SOURCE_LABEL,
+                    ':account'        => $username,
+                    ':php_version'    => $version,
+                    ':last_synced_at' => $syncedAt,
+                ]);
+                $totalVhosts++;
+            } catch (PDOException $e) {
+                // Same vhost claimed twice within this one source - flag it
+                // rather than silently dropping or overwriting, since two
+                // accounts on the same reseller both claiming the same
+                // domain is a genuine account hygiene problem.
+                fwrite(STDERR, "  WARNING: vhost '{$vhost}' already claimed by another account in source '" . WHM_SOURCE_LABEL . "' - skipping duplicate from '{$username}'\n");
+            }
         }
 
         $updateAcctPhp->execute([
             ':php_version' => $primaryVersion,
             ':username'    => $username,
+            ':whm_source'  => WHM_SOURCE_LABEL,
         ]);
 
         $mainDomain = $domainInfo['main'] ?? $domain;
+        $domainsToInsert = [];
         if ($mainDomain) {
-            $upsertDomain->execute([
-                ':domain'         => $mainDomain,
-                ':account'        => $username,
-                ':domain_type'    => 'main',
-                ':last_synced_at' => $syncedAt,
-            ]);
-            $totalDomains++;
+            $domainsToInsert[] = [$mainDomain, 'main'];
         }
         foreach ($domainInfo['addon'] as $addonDomain) {
-            $upsertDomain->execute([
-                ':domain'         => $addonDomain,
-                ':account'        => $username,
-                ':domain_type'    => 'addon',
-                ':last_synced_at' => $syncedAt,
-            ]);
-            $totalDomains++;
+            $domainsToInsert[] = [$addonDomain, 'addon'];
         }
         foreach ($domainInfo['parked'] as $parkedDomain) {
-            $upsertDomain->execute([
-                ':domain'         => $parkedDomain,
-                ':account'        => $username,
-                ':domain_type'    => 'parked',
-                ':last_synced_at' => $syncedAt,
-            ]);
-            $totalDomains++;
+            $domainsToInsert[] = [$parkedDomain, 'parked'];
+        }
+
+        foreach ($domainsToInsert as [$domainName, $domainType]) {
+            try {
+                $insertDomain->execute([
+                    ':domain'         => $domainName,
+                    ':whm_source'     => WHM_SOURCE_LABEL,
+                    ':account'        => $username,
+                    ':domain_type'    => $domainType,
+                    ':last_synced_at' => $syncedAt,
+                ]);
+                $totalDomains++;
+            } catch (PDOException $e) {
+                fwrite(STDERR, "  WARNING: domain '{$domainName}' already claimed by another account in source '" . WHM_SOURCE_LABEL . "' - skipping duplicate from '{$username}'\n");
+            }
         }
 
         $pdo->commit();
@@ -425,7 +505,7 @@ try {
     $accounts = sync_whm_accounts($pdo, $syncedAt);
     $details = sync_account_details($pdo, $syncedAt, $accounts);
 
-    echo "\nDone.\n";
+    echo "\nDone. (source: " . WHM_SOURCE_LABEL . ")\n";
     echo "  Accounts synced: " . count($accounts) . "\n";
     echo "  PHP version records synced: {$details['vhosts']}\n";
     echo "  Domain records synced (main+addon+parked): {$details['domains']}\n";

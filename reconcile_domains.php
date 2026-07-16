@@ -19,8 +19,15 @@
  *                          which usually means the domain is registered
  *                          with you but the site is live somewhere else.
  *
- * Run this after both sync_synergy_domains.php and sync_whm_accounts.php
- * have completed successfully.
+ *   4. DUPLICATE_WHM     - the same domain is hosted under BOTH Shock
+ *                          reseller accounts. Not a Synergy-vs-WHM issue,
+ *                          just flagged because it's worth knowing about
+ *                          and cleaning up.
+ *
+ * Run this after sync_synergy_domains.php AND sync_whm_accounts.php have
+ * been run for EVERY reseller account (each with its own WHM_SOURCE_LABEL -
+ * see sync_whm_accounts.php). This script reads whatever is currently in
+ * websites.sqlite, so it automatically covers all synced sources at once.
  *
  * Usage:
  *   php reconcile_domains.php
@@ -80,17 +87,22 @@ function reconcile(PDO $pdo): array {
         }
     }
 
-    // --- Load WHM domains (main + addon + parked) ---
+    // --- Load WHM domains (main + addon + parked, across BOTH reseller
+    // accounts) ---
     $whmRows = $pdo->query("
-        SELECT domain, account, domain_type
+        SELECT domain, account, domain_type, whm_source
         FROM whm_domains
     ")->fetchAll(PDO::FETCH_ASSOC);
 
+    // Group by normalized domain first, since with two reseller accounts
+    // it's technically possible (and worth catching) for the same domain
+    // to show up under both. Track all matches per domain rather than
+    // just keeping the last one seen.
     $whmByNorm = [];
     foreach ($whmRows as $row) {
         $norm = normalize_domain($row['domain']);
         if ($norm !== null) {
-            $whmByNorm[$norm] = $row;
+            $whmByNorm[$norm][] = $row;
         }
     }
 
@@ -101,7 +113,30 @@ function reconcile(PDO $pdo): array {
 
     foreach ($allDomains as $domain) {
         $inSynergy = $synergyByNorm[$domain] ?? null;
-        $inWhm = $whmByNorm[$domain] ?? null;
+        $whmMatches = $whmByNorm[$domain] ?? [];
+        $inWhm = $whmMatches[0] ?? null; // primary match for display purposes
+
+        // Flag the (hopefully rare) case where the same domain is hosted
+        // under BOTH reseller accounts - a genuine account hygiene issue
+        // worth fixing regardless of what Synergy says.
+        $distinctSources = array_unique(array_column($whmMatches, 'whm_source'));
+        if (count($distinctSources) > 1) {
+            $accountList = implode(', ', array_map(
+                fn($m) => "{$m['account']}@{$m['whm_source']} ({$m['domain_type']})",
+                $whmMatches
+            ));
+            $results[] = [
+                'domain'          => $domain,
+                'status'          => 'DUPLICATE_WHM',
+                'detail'          => "Domain is hosted under MORE THAN ONE reseller account: {$accountList}",
+                'synergy_status'  => $inSynergy['domain_status'] ?? null,
+                'synergy_expiry'  => $inSynergy['domain_expiry'] ?? null,
+                'whm_account'     => $inWhm['account'] ?? null,
+                'whm_domain_type' => $inWhm['domain_type'] ?? null,
+                'whm_source'      => implode('+', $distinctSources),
+            ];
+            continue;
+        }
 
         if ($inSynergy && !$inWhm) {
             $results[] = [
@@ -112,6 +147,7 @@ function reconcile(PDO $pdo): array {
                 'synergy_expiry' => $inSynergy['domain_expiry'],
                 'whm_account'   => null,
                 'whm_domain_type' => null,
+                'whm_source'    => null,
             ];
             continue;
         }
@@ -120,11 +156,12 @@ function reconcile(PDO $pdo): array {
             $results[] = [
                 'domain'        => $domain,
                 'status'        => 'ORPHANED_WHM',
-                'detail'        => "Hosted on Shock under account '{$inWhm['account']}' ({$inWhm['domain_type']}), not found in Synergy domain list",
+                'detail'        => "Hosted on Shock (account '{$inWhm['account']}' on '{$inWhm['whm_source']}', {$inWhm['domain_type']}), not found in Synergy domain list",
                 'synergy_status' => null,
                 'synergy_expiry' => null,
                 'whm_account'   => $inWhm['account'],
                 'whm_domain_type' => $inWhm['domain_type'],
+                'whm_source'    => $inWhm['whm_source'],
             ];
             continue;
         }
@@ -159,6 +196,7 @@ function reconcile(PDO $pdo): array {
             'synergy_expiry'  => $inSynergy['domain_expiry'],
             'whm_account'     => $inWhm['account'],
             'whm_domain_type' => $inWhm['domain_type'],
+            'whm_source'      => $inWhm['whm_source'],
         ];
     }
 
@@ -166,8 +204,12 @@ function reconcile(PDO $pdo): array {
 }
 
 function store_results(PDO $pdo, array $results, string $runAt): void {
+    // This table is always fully rebuilt on each run, so drop-and-recreate
+    // is simpler than migrating in place (and avoids needing separate
+    // migration logic if the schema changes again later).
+    $pdo->exec("DROP TABLE IF EXISTS reconciliation_results");
     $pdo->exec("
-        CREATE TABLE IF NOT EXISTS reconciliation_results (
+        CREATE TABLE reconciliation_results (
             domain            TEXT,
             status            TEXT,
             detail            TEXT,
@@ -175,20 +217,16 @@ function store_results(PDO $pdo, array $results, string $runAt): void {
             synergy_expiry    TEXT,
             whm_account       TEXT,
             whm_domain_type   TEXT,
+            whm_source        TEXT,
             run_at            TEXT
         )
     ");
 
-    // Clear prior run's results so this table always reflects the latest
-    // reconciliation rather than accumulating history. If you want a
-    // historical trail instead, drop this line and query by run_at.
-    $pdo->exec("DELETE FROM reconciliation_results");
-
     $insert = $pdo->prepare("
         INSERT INTO reconciliation_results
-            (domain, status, detail, synergy_status, synergy_expiry, whm_account, whm_domain_type, run_at)
+            (domain, status, detail, synergy_status, synergy_expiry, whm_account, whm_domain_type, whm_source, run_at)
         VALUES
-            (:domain, :status, :detail, :synergy_status, :synergy_expiry, :whm_account, :whm_domain_type, :run_at)
+            (:domain, :status, :detail, :synergy_status, :synergy_expiry, :whm_account, :whm_domain_type, :whm_source, :run_at)
     ");
 
     $pdo->beginTransaction();
@@ -201,6 +239,7 @@ function store_results(PDO $pdo, array $results, string $runAt): void {
             ':synergy_expiry'  => $r['synergy_expiry'],
             ':whm_account'     => $r['whm_account'],
             ':whm_domain_type' => $r['whm_domain_type'],
+            ':whm_source'      => $r['whm_source'] ?? null,
             ':run_at'          => $runAt,
         ]);
     }
@@ -209,7 +248,7 @@ function store_results(PDO $pdo, array $results, string $runAt): void {
 
 function write_csv(array $results): void {
     $fh = fopen(CSV_PATH, 'w');
-    fputcsv($fh, ['domain', 'status', 'detail', 'synergy_status', 'synergy_expiry', 'whm_account', 'whm_domain_type']);
+    fputcsv($fh, ['domain', 'status', 'detail', 'synergy_status', 'synergy_expiry', 'whm_account', 'whm_domain_type', 'whm_source']);
     foreach ($results as $r) {
         fputcsv($fh, [
             $r['domain'],
@@ -219,6 +258,7 @@ function write_csv(array $results): void {
             $r['synergy_expiry'],
             $r['whm_account'],
             $r['whm_domain_type'],
+            $r['whm_source'] ?? null,
         ]);
     }
     fclose($fh);
@@ -234,6 +274,20 @@ function print_summary(array $results): void {
     echo "Total domains examined: " . count($results) . "\n\n";
     foreach ($counts as $status => $count) {
         echo str_pad($status, 24) . ": {$count}\n";
+    }
+
+    if (!empty($counts['DUPLICATE_WHM'])) {
+        echo "\n--- ACCOUNT HYGIENE: domains hosted under BOTH reseller accounts ---\n";
+        $shown = 0;
+        foreach ($results as $r) {
+            if ($r['status'] === 'DUPLICATE_WHM' && $shown < 15) {
+                echo "  {$r['domain']}  -  {$r['detail']}\n";
+                $shown++;
+            }
+        }
+        if ($counts['DUPLICATE_WHM'] > 15) {
+            echo "  ... and " . ($counts['DUPLICATE_WHM'] - 15) . " more, see CSV for full list\n";
+        }
     }
 
     echo "\n--- Orphaned in Synergy (registered, not found hosted on Shock) ---\n";
