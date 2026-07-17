@@ -1,5 +1,5 @@
 .env
 node_modules
 websites.sqlite
-reconciliation_report.csv
-whois_orphaned_whm_report.csv
+*.csv
+wordpress_report_greendomain.net:greendom.csv

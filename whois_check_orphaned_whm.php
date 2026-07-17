@@ -251,7 +251,7 @@ function run(): void {
 
     // Export CSV
     $fh = fopen(CSV_PATH, 'w');
-    fputcsv($fh, ['domain', 'whois_status', 'registrar', 'whm_account', 'whm_domain_type', 'whm_source', 'raw_snippet']);
+    fputcsv($fh, ['domain', 'whois_status', 'registrar', 'whm_account', 'whm_domain_type', 'whm_source', 'raw_snippet'], ',', '"', '\\');
     $rows = $pdo->query("SELECT * FROM whois_results ORDER BY whois_status, domain")->fetchAll(PDO::FETCH_ASSOC);
     foreach ($rows as $r) {
         fputcsv($fh, [
@@ -262,7 +262,7 @@ function run(): void {
             $r['whm_domain_type'],
             $r['whm_source'],
             $r['raw_snippet'],
-        ]);
+        ], ',', '"', '\\');
     }
     fclose($fh);
 

@@ -257,7 +257,7 @@ function store_results(PDO $pdo, array $results, string $runAt): void {
 
 function write_csv(array $results): void {
     $fh = fopen(CSV_PATH, 'w');
-    fputcsv($fh, ['domain', 'status', 'detail', 'synergy_status', 'synergy_expiry', 'whm_account', 'whm_domain_type', 'whm_source']);
+    fputcsv($fh, ['domain', 'status', 'detail', 'synergy_status', 'synergy_expiry', 'whm_account', 'whm_domain_type', 'whm_source'], ',', '"', '\\');
     foreach ($results as $r) {
         fputcsv($fh, [
             $r['domain'],
@@ -268,7 +268,7 @@ function write_csv(array $results): void {
             $r['whm_account'],
             $r['whm_domain_type'],
             $r['whm_source'] ?? null,
-        ]);
+        ], ',', '"', '\\');
     }
     fclose($fh);
 }
