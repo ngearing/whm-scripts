@@ -2,4 +2,4 @@
 node_modules
 websites.sqlite
 *.csv
-wordpress_report_greendomain.net:greendom.csv
+*.jsonl
