@@ -139,10 +139,19 @@ function reconcile(PDO $pdo): array {
         }
 
         if ($inSynergy && !$inWhm) {
+            // A blank/null expiry means Synergy is still listing this domain
+            // in the account's history, but it's actually lapsed/expired and
+            // no longer truly "yours" - not a real orphan requiring action,
+            // just old data. Keep it in its own bucket so it doesn't pollute
+            // the list of domains that genuinely need a decision made.
+            $isLapsed = empty($inSynergy['domain_expiry']);
+
             $results[] = [
                 'domain'        => $domain,
-                'status'        => 'ORPHANED_SYNERGY',
-                'detail'        => 'Registered in Synergy, no matching cPanel domain found on Shock',
+                'status'        => $isLapsed ? 'LAPSED_SYNERGY' : 'ORPHANED_SYNERGY',
+                'detail'        => $isLapsed
+                    ? 'Listed in Synergy account history but has no expiry date - already lapsed/expired, not currently registered'
+                    : 'Registered in Synergy, no matching cPanel domain found on Shock',
                 'synergy_status' => $inSynergy['domain_status'],
                 'synergy_expiry' => $inSynergy['domain_expiry'],
                 'whm_account'   => null,
@@ -290,7 +299,7 @@ function print_summary(array $results): void {
         }
     }
 
-    echo "\n--- Orphaned in Synergy (registered, not found hosted on Shock) ---\n";
+    echo "\n--- Orphaned in Synergy (currently registered, not found hosted on Shock) ---\n";
     $shown = 0;
     foreach ($results as $r) {
         if ($r['status'] === 'ORPHANED_SYNERGY' && $shown < 15) {
@@ -300,6 +309,14 @@ function print_summary(array $results): void {
     }
     if (($counts['ORPHANED_SYNERGY'] ?? 0) > 15) {
         echo "  ... and " . ($counts['ORPHANED_SYNERGY'] - 15) . " more, see CSV for full list\n";
+    }
+    if (($counts['ORPHANED_SYNERGY'] ?? 0) === 0) {
+        echo "  (none)\n";
+    }
+
+    if (!empty($counts['LAPSED_SYNERGY'])) {
+        echo "\n--- Lapsed in Synergy (already expired, informational only - no action needed) ---\n";
+        echo "  {$counts['LAPSED_SYNERGY']} domains with no expiry date on file - see CSV (status=LAPSED_SYNERGY) if you want the full list\n";
     }
 
     echo "\n--- Orphaned in WHM (hosted on Shock, not found in Synergy) ---\n";
