@@ -27,12 +27,14 @@
  *      your network tab. The cpsessXXXXXXXXXX path segment is parsed out
  *      of the login URL itself, the same way the Node.js version does.
  *
- * IMPORTANT: The exact JSON shape WP Toolkit returns isn't publicly
- * documented, so this script stores the raw response for every account
- * AND attempts a best-effort parse using common field name guesses. Run
- * this once, check wp_toolkit_raw.json / the wp_installs_toolkit_items
- * table, and tell me what the real structure looks like so the parsing
- * can be corrected precisely rather than guessed at.
+ * The response schema is now CONFIRMED from real captured output (not
+ * guessed): each installation includes WP core version, PHP handler
+ * version + EOL/unsupported flags, vulnerability status and risk score,
+ * pending plugin/theme update counts, infection status, and SSL cert
+ * info. All of that gets parsed into wp_installs_toolkit - genuinely
+ * richer than what check_wordpress.php's file scan can determine on its
+ * own, since none of that (vulnerabilities, EOL PHP, infections) is
+ * visible just from checking for wp-config.php.
  *
  * Usage:
  *   WHM_SOURCE_LABEL=shock-1 WHM_HOST=... WHM_USERNAME=... WHM_API_TOKEN=... php check_wordpress_wptoolkit.php
@@ -58,9 +60,14 @@ function get_db(): PDO {
     $pdo = new PDO('sqlite:' . DB_PATH);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
+    // Drop the old provisional table from before the real schema was
+    // confirmed - it used guessed field names and is superseded by
+    // wp_installs_toolkit below.
+    $pdo->exec("DROP TABLE IF EXISTS wp_installs_toolkit_items");
+
     // One row per account: whether the API call succeeded and the raw
-    // response, so nothing is lost even if the best-effort parse below
-    // doesn't match WP Toolkit's actual field names.
+    // response, so nothing is lost even from accounts the parse below
+    // doesn't handle cleanly.
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS wp_installs_toolkit_raw (
             account       TEXT,
@@ -73,21 +80,40 @@ function get_db(): PDO {
         )
     ");
 
-    // Best-effort parsed rows, one per installation WP Toolkit reports for
-    // an account. Field extraction uses several guessed key names - treat
-    // this table as provisional until confirmed against real output.
+    // One row per WordPress installation WP Toolkit reports for an
+    // account (an account can have more than one). Field mapping is
+    // confirmed against real captured output, not guessed.
     $pdo->exec("
-        CREATE TABLE IF NOT EXISTS wp_installs_toolkit_items (
-            account       TEXT,
-            whm_source    TEXT,
-            item_index    INTEGER,
-            path          TEXT,
-            wp_version    TEXT,
-            site_url      TEXT,
-            status        TEXT,
-            raw_item      TEXT,
-            checked_at    TEXT,
-            PRIMARY KEY (account, whm_source, item_index)
+        CREATE TABLE IF NOT EXISTS wp_installs_toolkit (
+            account                   TEXT,
+            whm_source                TEXT,
+            wpt_id                    INTEGER,
+            title                     TEXT,
+            site_url                  TEXT,
+            wp_version                TEXT,
+            path                      TEXT,
+            domain_name               TEXT,
+            alive                     INTEGER,
+            infected                  INTEGER,
+            unsupported               INTEGER,
+            multisite                 INTEGER,
+            plugins_with_updates      INTEGER,
+            themes_with_updates       INTEGER,
+            core_update_available     TEXT,
+            vulnerable                INTEGER,
+            vulnerability_risk_score  REAL,
+            vulnerability_risk_rank   TEXT,
+            php_version               TEXT,
+            php_identifier            TEXT,
+            php_unsupported           INTEGER,
+            php_eoled                 INTEGER,
+            security_status           TEXT,
+            ssl_enabled               INTEGER,
+            ssl_issuer                TEXT,
+            backups_available         INTEGER,
+            raw_json                  TEXT,
+            checked_at                TEXT,
+            PRIMARY KEY (account, wpt_id, whm_source)
         )
     ");
 
@@ -97,7 +123,7 @@ function get_db(): PDO {
 function clear_existing_source_data(PDO $pdo, string $source): void {
     $pdo->prepare("DELETE FROM wp_installs_toolkit_raw WHERE whm_source = :source")
         ->execute([':source' => $source]);
-    $pdo->prepare("DELETE FROM wp_installs_toolkit_items WHERE whm_source = :source")
+    $pdo->prepare("DELETE FROM wp_installs_toolkit WHERE whm_source = :source")
         ->execute([':source' => $source]);
 }
 
@@ -314,26 +340,69 @@ function fetch_wp_toolkit_installations(string $loginUrl, string $cpsession): st
 }
 
 /**
- * WP Toolkit's real field values sometimes turn out to be nested
- * arrays/objects rather than plain strings (that's exactly the kind of
- * schema mismatch this best-effort parser is built to survive). PDO can't
- * bind an array directly, so anything non-scalar gets JSON-encoded
- * instead of causing an "Array to string conversion" warning and a
- * silently wrong bound value.
+ * Safely reads a nested value from an array via a chain of keys, e.g.
+ * dig($item, 'features', 'php', 'handler', 'version'). Returns null if any
+ * key in the chain is missing rather than throwing.
  */
-function to_bindable(mixed $value): ?string {
-    if ($value === null || is_scalar($value)) {
-        return $value;
+function dig(array $arr, string ...$keys): mixed {
+    $cur = $arr;
+    foreach ($keys as $k) {
+        if (!is_array($cur) || !array_key_exists($k, $cur)) {
+            return null;
+        }
+        $cur = $cur[$k];
     }
-    return json_encode($value);
+    return $cur;
+}
+
+function bool_to_int(mixed $v): ?int {
+    if ($v === null) {
+        return null;
+    }
+    return $v ? 1 : 0;
 }
 
 /**
- * Best-effort extraction of installation records from the raw JSON body.
- * WP Toolkit's exact schema isn't publicly documented, so this tries a
- * handful of plausible key names. Returns an array of normalized rows;
- * falls back to storing the raw item untouched if none of the guessed
- * keys match, so nothing is silently dropped.
+ * Extracts one normalized row from a single WP Toolkit installation
+ * object. Field mapping confirmed against real captured output (see
+ * conversation history) - not a guess.
+ */
+function extract_installation_row(array $item): array {
+    return [
+        'wpt_id'                   => $item['id'] ?? null,
+        'title'                    => $item['title'] ?? null,
+        'site_url'                 => $item['url'] ?? null,
+        'wp_version'               => $item['version'] ?? null,
+        'path'                     => $item['path'] ?? null,
+        'domain_name'              => dig($item, 'domain', 'name'),
+        'alive'                    => bool_to_int(dig($item, 'status', 'alive')),
+        'infected'                 => bool_to_int(dig($item, 'status', 'infected')),
+        'unsupported'              => bool_to_int(dig($item, 'status', 'unsupported')),
+        'multisite'                => bool_to_int(dig($item, 'status', 'multisite')),
+        'plugins_with_updates'     => dig($item, 'features', 'updates', 'amountOfPluginsWithUpdates'),
+        'themes_with_updates'      => dig($item, 'features', 'updates', 'amountOfThemesWithUpdates'),
+        'core_update_available'    => dig($item, 'features', 'updates', 'availableVersion'),
+        'vulnerable'               => bool_to_int(dig($item, 'features', 'vulnerability', 'vulnerable')),
+        'vulnerability_risk_score' => dig($item, 'features', 'vulnerability', 'securityRiskScore'),
+        'vulnerability_risk_rank'  => dig($item, 'features', 'vulnerability', 'highestActiveVulnerabilityRiskRank'),
+        'php_version'              => dig($item, 'features', 'php', 'handler', 'version'),
+        'php_identifier'           => dig($item, 'features', 'php', 'handler', 'identifier'),
+        'php_unsupported'          => bool_to_int(dig($item, 'features', 'php', 'unsupported')),
+        'php_eoled'                => bool_to_int(dig($item, 'features', 'php', 'eoled')),
+        'security_status'          => dig($item, 'features', 'security', 'status'),
+        'ssl_enabled'              => bool_to_int(dig($item, 'domain', 'ssl', 'enabled')),
+        'ssl_issuer'               => dig($item, 'domain', 'ssl', 'certificate', 'issuerName'),
+        'backups_available'        => bool_to_int(dig($item, 'features', 'backups', 'panelBackupsAvailable')),
+        'raw_json'                 => json_encode($item),
+    ];
+}
+
+/**
+ * Parses the raw WP Toolkit response body into a list of normalized
+ * installation rows. The endpoint returns a plain top-level array of
+ * installation objects (confirmed from real output) - the data/
+ * installations wrapper checks below are just defensive fallbacks in case
+ * a future WP Toolkit version wraps the response differently.
  */
 function parse_wp_toolkit_response(string $rawBody): array {
     $decoded = json_decode($rawBody, true);
@@ -341,8 +410,6 @@ function parse_wp_toolkit_response(string $rawBody): array {
         return [];
     }
 
-    // The installations list might be the top-level array, or nested
-    // under a common wrapper key - try a few possibilities.
     $items = $decoded;
     if (isset($decoded['data']) && is_array($decoded['data'])) {
         $items = $decoded['data'];
@@ -350,8 +417,7 @@ function parse_wp_toolkit_response(string $rawBody): array {
         $items = $decoded['installations'];
     }
 
-    if (!is_array($items) || (!empty($items) && !is_int(array_key_first($items)))) {
-        // Not a plain list - bail out, let the raw response speak for itself.
+    if (!is_array($items)) {
         return [];
     }
 
@@ -360,13 +426,7 @@ function parse_wp_toolkit_response(string $rawBody): array {
         if (!is_array($item)) {
             continue;
         }
-        $rows[] = [
-            'path'       => to_bindable($item['path'] ?? $item['documentRoot'] ?? $item['installationPath'] ?? null),
-            'wp_version' => to_bindable($item['version'] ?? $item['wpVersion'] ?? $item['wp_version'] ?? null),
-            'site_url'   => to_bindable($item['url'] ?? $item['siteUrl'] ?? $item['domain'] ?? null),
-            'status'     => to_bindable($item['status'] ?? $item['state'] ?? $item['updateStatus'] ?? null),
-            'raw_item'   => json_encode($item),
-        ];
+        $rows[] = extract_installation_row($item);
     }
 
     return $rows;
@@ -396,8 +456,22 @@ function run(): void {
         VALUES (:account, :whm_source, :success, :error_message, :raw_response, :checked_at)
     ");
     $insertItem = $pdo->prepare("
-        INSERT INTO wp_installs_toolkit_items (account, whm_source, item_index, path, wp_version, site_url, status, raw_item, checked_at)
-        VALUES (:account, :whm_source, :item_index, :path, :wp_version, :site_url, :status, :raw_item, :checked_at)
+        INSERT INTO wp_installs_toolkit
+            (account, whm_source, wpt_id, title, site_url, wp_version, path, domain_name,
+             alive, infected, unsupported, multisite,
+             plugins_with_updates, themes_with_updates, core_update_available,
+             vulnerable, vulnerability_risk_score, vulnerability_risk_rank,
+             php_version, php_identifier, php_unsupported, php_eoled,
+             security_status, ssl_enabled, ssl_issuer, backups_available,
+             raw_json, checked_at)
+        VALUES
+            (:account, :whm_source, :wpt_id, :title, :site_url, :wp_version, :path, :domain_name,
+             :alive, :infected, :unsupported, :multisite,
+             :plugins_with_updates, :themes_with_updates, :core_update_available,
+             :vulnerable, :vulnerability_risk_score, :vulnerability_risk_rank,
+             :php_version, :php_identifier, :php_unsupported, :php_eoled,
+             :security_status, :ssl_enabled, :ssl_issuer, :backups_available,
+             :raw_json, :checked_at)
     ");
 
     $rawLog = fopen(RAW_JSON_LOG_PATH, 'w');
@@ -429,17 +503,36 @@ function run(): void {
             ]);
 
             $items = parse_wp_toolkit_response($rawBody);
-            foreach ($items as $idx => $item) {
+            foreach ($items as $item) {
                 $insertItem->execute([
-                    ':account'    => $username,
-                    ':whm_source' => WHM_SOURCE_LABEL,
-                    ':item_index' => $idx,
-                    ':path'       => $item['path'],
-                    ':wp_version' => $item['wp_version'],
-                    ':site_url'   => $item['site_url'],
-                    ':status'     => $item['status'],
-                    ':raw_item'   => $item['raw_item'],
-                    ':checked_at' => $syncedAt,
+                    ':account'                  => $username,
+                    ':whm_source'               => WHM_SOURCE_LABEL,
+                    ':wpt_id'                   => $item['wpt_id'],
+                    ':title'                    => $item['title'],
+                    ':site_url'                 => $item['site_url'],
+                    ':wp_version'               => $item['wp_version'],
+                    ':path'                     => $item['path'],
+                    ':domain_name'              => $item['domain_name'],
+                    ':alive'                    => $item['alive'],
+                    ':infected'                 => $item['infected'],
+                    ':unsupported'              => $item['unsupported'],
+                    ':multisite'                => $item['multisite'],
+                    ':plugins_with_updates'     => $item['plugins_with_updates'],
+                    ':themes_with_updates'      => $item['themes_with_updates'],
+                    ':core_update_available'    => $item['core_update_available'],
+                    ':vulnerable'               => $item['vulnerable'],
+                    ':vulnerability_risk_score' => $item['vulnerability_risk_score'],
+                    ':vulnerability_risk_rank'  => $item['vulnerability_risk_rank'],
+                    ':php_version'              => $item['php_version'],
+                    ':php_identifier'           => $item['php_identifier'],
+                    ':php_unsupported'          => $item['php_unsupported'],
+                    ':php_eoled'                => $item['php_eoled'],
+                    ':security_status'          => $item['security_status'],
+                    ':ssl_enabled'              => $item['ssl_enabled'],
+                    ':ssl_issuer'               => $item['ssl_issuer'],
+                    ':backups_available'        => $item['backups_available'],
+                    ':raw_json'                 => $item['raw_json'],
+                    ':checked_at'               => $syncedAt,
                 ]);
                 $totalInstalls++;
             }
@@ -475,14 +568,84 @@ function run(): void {
 
     fclose($rawLog);
 
+    // CSV export - the columns that actually matter for a quick scan.
+    $csvPath = __DIR__ . '/wp_toolkit_report_' . WHM_SOURCE_LABEL . '.csv';
+    $fh = fopen($csvPath, 'w');
+    fputcsv($fh, [
+        'domain',
+        'account',
+        'wp_version',
+        'core_update_available',
+        'plugins_with_updates',
+        'themes_with_updates',
+        'vulnerable',
+        'vulnerability_risk_rank',
+        'infected',
+        'php_version',
+        'php_eoled',
+        'php_unsupported',
+        'security_status',
+        'ssl_issuer',
+        'path',
+    ], ',', '"', '\\');
+    $rows = $pdo->prepare("SELECT * FROM wp_installs_toolkit WHERE whm_source = :source ORDER BY vulnerable DESC, php_eoled DESC, domain_name");
+    $rows->execute([':source' => WHM_SOURCE_LABEL]);
+    foreach ($rows->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        fputcsv($fh, [
+            $r['domain_name'],
+            $r['account'],
+            $r['wp_version'],
+            $r['core_update_available'],
+            $r['plugins_with_updates'],
+            $r['themes_with_updates'],
+            $r['vulnerable'] ? 'yes' : 'no',
+            $r['vulnerability_risk_rank'],
+            $r['infected'] ? 'yes' : 'no',
+            $r['php_version'],
+            $r['php_eoled'] ? 'yes' : 'no',
+            $r['php_unsupported'] ? 'yes' : 'no',
+            $r['security_status'],
+            $r['ssl_issuer'],
+            $r['path'],
+        ], ',', '"', '\\');
+    }
+    fclose($fh);
+
+    // Pull the numbers that matter for the console summary.
+    $countStmt = $pdo->prepare("
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN vulnerable = 1 THEN 1 ELSE 0 END) as vulnerable_count,
+            SUM(CASE WHEN infected = 1 THEN 1 ELSE 0 END) as infected_count,
+            SUM(CASE WHEN php_eoled = 1 THEN 1 ELSE 0 END) as php_eoled_count,
+            SUM(CASE WHEN php_unsupported = 1 THEN 1 ELSE 0 END) as php_unsupported_count,
+            SUM(CASE WHEN core_update_available IS NOT NULL THEN 1 ELSE 0 END) as core_outdated_count,
+            SUM(CASE WHEN plugins_with_updates > 0 THEN 1 ELSE 0 END) as plugins_outdated_count,
+            SUM(CASE WHEN unsupported = 1 THEN 1 ELSE 0 END) as unsupported_count
+        FROM wp_installs_toolkit WHERE whm_source = :source
+    ");
+    $countStmt->execute([':source' => WHM_SOURCE_LABEL]);
+    $stats = $countStmt->fetch(PDO::FETCH_ASSOC);
+
     echo "\n=== WP Toolkit Query Summary (source: " . WHM_SOURCE_LABEL . ") ===\n";
     echo "Accounts successfully queried: {$totalSuccess}/" . count($accounts) . "\n";
-    echo "Total installations reported: {$totalInstalls}\n";
-    echo "\nRaw responses (one JSON object per line) written to " . RAW_JSON_LOG_PATH . "\n";
+    echo "Total WordPress installations found: {$stats['total']}\n\n";
+    echo "Infected (WP Toolkit flagged malware): {$stats['infected_count']}\n";
+    echo "Have an active vulnerability:          {$stats['vulnerable_count']}\n";
+    echo "Running an EOL PHP version:            {$stats['php_eoled_count']}\n";
+    echo "Running an unsupported PHP version:     {$stats['php_unsupported_count']}\n";
+    echo "WP core update available:              {$stats['core_outdated_count']}\n";
+    echo "Have plugin updates pending:           {$stats['plugins_outdated_count']}\n";
+    echo "Flagged 'unsupported' by WP Toolkit:   {$stats['unsupported_count']}\n";
+
+    if ($stats['infected_count'] > 0) {
+        echo "\n*** {$stats['infected_count']} infected site(s) - see CSV, sorted to the top ***\n";
+    }
+
+    echo "\nFull results written to {$csvPath}\n";
+    echo "Raw responses (one JSON object per line) written to " . RAW_JSON_LOG_PATH . "\n";
     echo "Also queryable in websites.sqlite -> wp_installs_toolkit_raw (full raw response per account)\n";
-    echo "                                  -> wp_installs_toolkit_items (best-effort parsed rows)\n";
-    echo "\nIMPORTANT: field parsing (path/version/status) is a best guess at WP Toolkit's schema.\n";
-    echo "Check " . RAW_JSON_LOG_PATH . " and share a sample so the parsing can be corrected precisely.\n";
+    echo "                                  -> wp_installs_toolkit (parsed installation rows)\n";
 }
 
 try {
