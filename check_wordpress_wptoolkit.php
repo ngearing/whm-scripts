@@ -80,9 +80,14 @@ function get_db(): PDO {
         )
     ");
 
-    // One row per WordPress installation WP Toolkit reports for an
-    // account (an account can have more than one). Field mapping is
-    // confirmed against real captured output, not guessed.
+    // One row per WordPress installation. Most rows come from WP Toolkit
+    // (data_source = 'wp_toolkit') with the full field set below. If WP
+    // Toolkit reports zero installs for an account, a fallback file scan
+    // runs (same logic as check_wordpress.php) and any installs it finds
+    // are stored here too with data_source = 'file_scan_fallback' - those
+    // rows only have path/domain/wp_version filled in, since a filesystem
+    // scan can't see vulnerability/PHP-EOL/update data the way WP
+    // Toolkit's API can.
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS wp_installs_toolkit (
             account                   TEXT,
@@ -116,6 +121,22 @@ function get_db(): PDO {
             PRIMARY KEY (account, wpt_id, whm_source)
         )
     ");
+
+    // Non-destructive migration for anyone who already has this table from
+    // before the fallback feature existed - add the column rather than
+    // dropping the table, since it may already hold real vulnerability
+    // data you don't want to lose.
+    $columns = $pdo->query("PRAGMA table_info(wp_installs_toolkit)")->fetchAll(PDO::FETCH_ASSOC);
+    $hasDataSource = false;
+    foreach ($columns as $col) {
+        if ($col['name'] === 'data_source') {
+            $hasDataSource = true;
+            break;
+        }
+    }
+    if (!$hasDataSource) {
+        $pdo->exec("ALTER TABLE wp_installs_toolkit ADD COLUMN data_source TEXT DEFAULT 'wp_toolkit'");
+    }
 
     return $pdo;
 }
@@ -167,6 +188,208 @@ function whm_api_call(string $function, array $params = []): array {
     }
 
     return $decoded;
+}
+
+// ---------------------------------------------------------------------
+// FILE-SCAN FALLBACK (ported from check_wordpress.php)
+//
+// Runs only when WP Toolkit reports zero installs for an account, as a
+// safety net in case WP Toolkit itself isn't tracking an install that
+// genuinely exists on disk. Rows found this way go into wp_installs_toolkit
+// with data_source = 'file_scan_fallback' and only path/domain/version
+// filled in - a filesystem scan can't see vulnerability/PHP-EOL/update
+// data the way WP Toolkit's API can, so those fields stay null for these
+// rows by design, not by mistake.
+// ---------------------------------------------------------------------
+
+function uapi_call(string $username, string $module, string $function, array $extraParams = []): array {
+    $params = array_merge([
+        'cpanel.user'     => $username,
+        'cpanel.module'   => $module,
+        'cpanel.function' => $function,
+    ], $extraParams);
+
+    $response = whm_api_call('uapi_cpanel', $params);
+    return $response['data']['uapi'] ?? [];
+}
+
+/**
+ * Returns a list of ['domain' => ..., 'domain_type' => ..., 'docroot' => ...
+ * (absolute)] for every domain on this account that has a document root
+ * (main + addon; parked domains alias the main domain's docroot so are
+ * skipped).
+ */
+function get_docroots_for_account(string $username): array {
+    $result = uapi_call($username, 'DomainInfo', 'domains_data', ['format' => 'hash']);
+    $data = $result['data'] ?? [];
+
+    $entries = [];
+
+    $mainDomain = $data['main_domain'] ?? null;
+    if ($mainDomain && !empty($mainDomain['documentroot'])) {
+        $entries[] = ['domain' => $mainDomain['domain'] ?? null, 'domain_type' => 'main', 'docroot' => $mainDomain['documentroot']];
+    }
+
+    foreach ($data['addon_domains'] ?? [] as $addon) {
+        if (!empty($addon['documentroot'])) {
+            $entries[] = ['domain' => $addon['domain'] ?? null, 'domain_type' => 'addon', 'docroot' => $addon['documentroot']];
+        }
+    }
+
+    return $entries;
+}
+
+// Same scan limits/exclusions as check_wordpress.php - kept identical so
+// the fallback behaves consistently with the standalone scan script.
+define('MAX_SCAN_DEPTH', (int) (getenv('WP_SCAN_MAX_DEPTH') ?: 2));
+define('MAX_DIRS_PER_SITE', (int) (getenv('WP_SCAN_MAX_DIRS') ?: 150));
+const EXCLUDED_DIR_NAMES = [
+    'wp-admin',
+    'wp-includes',
+    'wp-content',
+    'cgi-bin',
+    'cache',
+    'tmp',
+    'temp',
+    'logs',
+    'log',
+    'node_modules',
+    'vendor',
+    '.git',
+    '.svn',
+    '.well-known',
+    '.cpanel',
+    'backup',
+    'backups',
+    'stats',
+    'webalizer',
+    'phpmyadmin',
+];
+
+/**
+ * Breadth-first search under $rootPath, up to MAX_SCAN_DEPTH levels deep,
+ * looking for wp-config.php. Identical logic to check_wordpress.php.
+ */
+function scan_for_wordpress_installs(string $username, string $rootPath): array {
+    $found = [];
+    $queue = [[$rootPath, 0]];
+    $visited = 0;
+
+    while (!empty($queue)) {
+        [$path, $depth] = array_shift($queue);
+        $visited++;
+
+        if ($visited > MAX_DIRS_PER_SITE) {
+            fwrite(STDERR, "      [scan limit] hit " . MAX_DIRS_PER_SITE . " directories under {$rootPath} - stopping early\n");
+            break;
+        }
+
+        try {
+            $result = uapi_call($username, 'Fileman', 'list_files', ['dir' => $path, 'types' => 'file|dir']);
+        } catch (Throwable $e) {
+            continue;
+        }
+
+        $entries = $result['data'] ?? [];
+        if (!is_array($entries)) {
+            $entries = [];
+        }
+
+        $hasWpConfig = false;
+        $subdirs = [];
+
+        foreach ($entries as $e) {
+            $name = $e['file'] ?? '';
+            $type = $e['type'] ?? '';
+
+            if ($type === 'file' && $name === 'wp-config.php') {
+                $hasWpConfig = true;
+            } elseif ($type === 'dir') {
+                if ($name === '' || str_starts_with($name, '.')) {
+                    continue;
+                }
+                if (in_array(strtolower($name), EXCLUDED_DIR_NAMES, true)) {
+                    continue;
+                }
+                $subdirs[] = $name;
+            }
+        }
+
+        if ($hasWpConfig) {
+            $found[] = ['docroot' => $path, 'wp_version' => fetch_wp_version_from_disk($username, $path)];
+            continue;
+        }
+
+        if ($depth < MAX_SCAN_DEPTH) {
+            foreach ($subdirs as $sub) {
+                $queue[] = [rtrim($path, '/') . '/' . $sub, $depth + 1];
+            }
+        }
+
+        usleep(80000);
+    }
+
+    return $found;
+}
+
+function fetch_wp_version_from_disk(string $username, string $installPath): ?string {
+    try {
+        $versionFileDir = rtrim($installPath, '/') . '/wp-includes';
+        $content = uapi_call($username, 'Fileman', 'get_file_content', ['dir' => $versionFileDir, 'file' => 'version.php']);
+        $fileContent = $content['data']['content'] ?? '';
+        if (preg_match('/\$wp_version\s*=\s*[\'"]([^\'"]+)[\'"]/', $fileContent, $m)) {
+            return $m[1];
+        }
+    } catch (Throwable $e) {
+        // Non-fatal - we still know WP is installed even without a version.
+    }
+    return null;
+}
+
+/**
+ * Runs the fallback scan for one account and returns rows shaped to match
+ * extract_installation_row()'s output, so both paths can be inserted with
+ * the same code. WP-Toolkit-only fields (vulnerability, PHP EOL, updates,
+ * etc.) are null here since a filesystem scan has no way to know them.
+ */
+function run_file_scan_fallback(string $username): array {
+    $docroots = get_docroots_for_account($username);
+    $rows = [];
+
+    foreach ($docroots as $entry) {
+        $installs = scan_for_wordpress_installs($username, $entry['docroot']);
+        foreach ($installs as $install) {
+            $rows[] = [
+                'wpt_id'                   => null,
+                'title'                    => null,
+                'site_url'                 => null,
+                'wp_version'               => $install['wp_version'],
+                'path'                     => $install['docroot'],
+                'domain_name'              => $entry['domain'],
+                'alive'                    => null,
+                'infected'                 => null,
+                'unsupported'              => null,
+                'multisite'                => null,
+                'plugins_with_updates'     => null,
+                'themes_with_updates'      => null,
+                'core_update_available'    => null,
+                'vulnerable'               => null,
+                'vulnerability_risk_score' => null,
+                'vulnerability_risk_rank'  => null,
+                'php_version'              => null,
+                'php_identifier'           => null,
+                'php_unsupported'          => null,
+                'php_eoled'                => null,
+                'security_status'          => null,
+                'ssl_enabled'              => null,
+                'ssl_issuer'               => null,
+                'backups_available'        => null,
+                'raw_json'                 => null,
+            ];
+        }
+    }
+
+    return $rows;
 }
 
 // ---------------------------------------------------------------------
@@ -463,7 +686,7 @@ function run(): void {
              vulnerable, vulnerability_risk_score, vulnerability_risk_rank,
              php_version, php_identifier, php_unsupported, php_eoled,
              security_status, ssl_enabled, ssl_issuer, backups_available,
-             raw_json, checked_at)
+             raw_json, data_source, checked_at)
         VALUES
             (:account, :whm_source, :wpt_id, :title, :site_url, :wp_version, :path, :domain_name,
              :alive, :infected, :unsupported, :multisite,
@@ -471,7 +694,7 @@ function run(): void {
              :vulnerable, :vulnerability_risk_score, :vulnerability_risk_rank,
              :php_version, :php_identifier, :php_unsupported, :php_eoled,
              :security_status, :ssl_enabled, :ssl_issuer, :backups_available,
-             :raw_json, :checked_at)
+             :raw_json, :data_source, :checked_at)
     ");
 
     $rawLog = fopen(RAW_JSON_LOG_PATH, 'w');
@@ -479,6 +702,7 @@ function run(): void {
     $consecutiveFailures = 0;
     $totalSuccess = 0;
     $totalInstalls = 0;
+    $totalFallbackFound = 0;
     $i = 0;
     $syncedAt = date('c');
 
@@ -532,9 +756,63 @@ function run(): void {
                     ':ssl_issuer'               => $item['ssl_issuer'],
                     ':backups_available'        => $item['backups_available'],
                     ':raw_json'                 => $item['raw_json'],
+                    ':data_source'              => 'wp_toolkit',
                     ':checked_at'               => $syncedAt,
                 ]);
                 $totalInstalls++;
+            }
+
+            // WP Toolkit reported nothing for this account - fall back to
+            // a direct filesystem scan just to make sure nothing's being
+            // missed (e.g. an install WP Toolkit itself isn't tracking).
+            if (count($items) === 0) {
+                echo "    -> 0 installs from WP Toolkit, running file-scan fallback for {$username}...\n";
+                try {
+                    $fallbackRows = run_file_scan_fallback($username);
+                } catch (Throwable $e) {
+                    fwrite(STDERR, "    [{$username}] File-scan fallback failed: " . $e->getMessage() . "\n");
+                    $fallbackRows = [];
+                }
+
+                foreach ($fallbackRows as $item) {
+                    $insertItem->execute([
+                        ':account'                  => $username,
+                        ':whm_source'               => WHM_SOURCE_LABEL,
+                        ':wpt_id'                   => $item['wpt_id'],
+                        ':title'                    => $item['title'],
+                        ':site_url'                 => $item['site_url'],
+                        ':wp_version'               => $item['wp_version'],
+                        ':path'                     => $item['path'],
+                        ':domain_name'              => $item['domain_name'],
+                        ':alive'                    => $item['alive'],
+                        ':infected'                 => $item['infected'],
+                        ':unsupported'              => $item['unsupported'],
+                        ':multisite'                => $item['multisite'],
+                        ':plugins_with_updates'     => $item['plugins_with_updates'],
+                        ':themes_with_updates'      => $item['themes_with_updates'],
+                        ':core_update_available'    => $item['core_update_available'],
+                        ':vulnerable'               => $item['vulnerable'],
+                        ':vulnerability_risk_score' => $item['vulnerability_risk_score'],
+                        ':vulnerability_risk_rank'  => $item['vulnerability_risk_rank'],
+                        ':php_version'              => $item['php_version'],
+                        ':php_identifier'           => $item['php_identifier'],
+                        ':php_unsupported'          => $item['php_unsupported'],
+                        ':php_eoled'                => $item['php_eoled'],
+                        ':security_status'          => $item['security_status'],
+                        ':ssl_enabled'              => $item['ssl_enabled'],
+                        ':ssl_issuer'               => $item['ssl_issuer'],
+                        ':backups_available'        => $item['backups_available'],
+                        ':raw_json'                 => $item['raw_json'],
+                        ':data_source'              => 'file_scan_fallback',
+                        ':checked_at'               => $syncedAt,
+                    ]);
+                    $totalInstalls++;
+                    $totalFallbackFound++;
+                }
+
+                if (count($fallbackRows) > 0) {
+                    echo "    -> file-scan fallback found " . count($fallbackRows) . " install(s) WP Toolkit missed!\n";
+                }
             }
 
             $totalSuccess++;
@@ -574,6 +852,7 @@ function run(): void {
     fputcsv($fh, [
         'domain',
         'account',
+        'data_source',
         'wp_version',
         'core_update_available',
         'plugins_with_updates',
@@ -594,6 +873,7 @@ function run(): void {
         fputcsv($fh, [
             $r['domain_name'],
             $r['account'],
+            $r['data_source'],
             $r['wp_version'],
             $r['core_update_available'],
             $r['plugins_with_updates'],
@@ -621,7 +901,8 @@ function run(): void {
             SUM(CASE WHEN php_unsupported = 1 THEN 1 ELSE 0 END) as php_unsupported_count,
             SUM(CASE WHEN core_update_available IS NOT NULL THEN 1 ELSE 0 END) as core_outdated_count,
             SUM(CASE WHEN plugins_with_updates > 0 THEN 1 ELSE 0 END) as plugins_outdated_count,
-            SUM(CASE WHEN unsupported = 1 THEN 1 ELSE 0 END) as unsupported_count
+            SUM(CASE WHEN unsupported = 1 THEN 1 ELSE 0 END) as unsupported_count,
+            SUM(CASE WHEN data_source = 'file_scan_fallback' THEN 1 ELSE 0 END) as fallback_count
         FROM wp_installs_toolkit WHERE whm_source = :source
     ");
     $countStmt->execute([':source' => WHM_SOURCE_LABEL]);
@@ -629,7 +910,9 @@ function run(): void {
 
     echo "\n=== WP Toolkit Query Summary (source: " . WHM_SOURCE_LABEL . ") ===\n";
     echo "Accounts successfully queried: {$totalSuccess}/" . count($accounts) . "\n";
-    echo "Total WordPress installations found: {$stats['total']}\n\n";
+    echo "Total WordPress installations found: {$stats['total']}\n";
+    echo "  - via WP Toolkit:      " . ($stats['total'] - $stats['fallback_count']) . "\n";
+    echo "  - via file-scan fallback: {$stats['fallback_count']} (WP Toolkit reported 0 for these accounts)\n\n";
     echo "Infected (WP Toolkit flagged malware): {$stats['infected_count']}\n";
     echo "Have an active vulnerability:          {$stats['vulnerable_count']}\n";
     echo "Running an EOL PHP version:            {$stats['php_eoled_count']}\n";
@@ -641,11 +924,14 @@ function run(): void {
     if ($stats['infected_count'] > 0) {
         echo "\n*** {$stats['infected_count']} infected site(s) - see CSV, sorted to the top ***\n";
     }
+    if ($stats['fallback_count'] > 0) {
+        echo "\n*** {$stats['fallback_count']} install(s) found only via file-scan fallback - WP Toolkit wasn't tracking these. Worth a manual look. ***\n";
+    }
 
     echo "\nFull results written to {$csvPath}\n";
     echo "Raw responses (one JSON object per line) written to " . RAW_JSON_LOG_PATH . "\n";
     echo "Also queryable in websites.sqlite -> wp_installs_toolkit_raw (full raw response per account)\n";
-    echo "                                  -> wp_installs_toolkit (parsed installation rows)\n";
+    echo "                                  -> wp_installs_toolkit (parsed installation rows, see data_source column)\n";
 }
 
 try {
