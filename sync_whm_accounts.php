@@ -27,6 +27,12 @@
  * touches account 1's data, even if both happen to reuse the same cPanel
  * username somewhere.
  *
+ * Config is read from real environment variables first, falling back to a
+ * .env file sitting next to this script (see load_dotenv() below) - so you
+ * can either export WHM_SOURCE_LABEL etc. per invocation as shown above,
+ * or set the shared credentials in .env and just override
+ * WHM_SOURCE_LABEL per run.
+ *
  * Requires:
  *   - PHP cURL extension (bundled with Homebrew's php formula)
  *   - PHP PDO SQLite extension (also bundled)
@@ -36,8 +42,47 @@
  */
 
 // ---------------------------------------------------------------------
-// CONFIG - fill these in, or load from environment variables so
-// credentials never end up committed to source control.
+// .ENV LOADER - no Composer/phpdotenv dependency. Reads simple KEY=VALUE
+// lines from a .env file next to this script (override the location with
+// DOTENV_PATH), skipping blanks/comments and stripping surrounding
+// quotes. Never overwrites a variable already set in the real shell
+// environment, so `WHM_API_TOKEN=xxx php script.php` or a CI secret still
+// wins over whatever is in .env.
+// ---------------------------------------------------------------------
+function load_dotenv(string $path): void {
+    if (!file_exists($path)) {
+        return; // no .env file present - fall back to real env / defaults
+    }
+
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+        if ($line === '' || str_starts_with($line, '#') || !str_contains($line, '=')) {
+            continue;
+        }
+
+        [$key, $value] = explode('=', $line, 2);
+        $key = trim($key);
+        $value = trim($value);
+
+        if (strlen($value) >= 2 && (
+            ($value[0] === '"' && $value[-1] === '"') ||
+            ($value[0] === "'" && $value[-1] === "'")
+        )) {
+            $value = substr($value, 1, -1);
+        }
+
+        if (getenv($key) === false) {
+            putenv("{$key}={$value}");
+            $_ENV[$key] = $value;
+        }
+    }
+}
+
+load_dotenv(getenv('DOTENV_PATH') ?: __DIR__ . '/.env');
+
+// ---------------------------------------------------------------------
+// CONFIG - fill these in, or load from environment variables (or .env,
+// loaded above) so credentials never end up committed to source control.
 // ---------------------------------------------------------------------
 
 // The hostname of your Shock Hosting reseller server, e.g. server3.shockhosting.com
