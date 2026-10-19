@@ -36,8 +36,8 @@
  * Run this after reconcile_domains.php.
  */
 
-define('DB_PATH', __DIR__ . '/websites.sqlite');
-define('CSV_PATH', __DIR__ . '/whois_orphaned_whm_report.csv');
+require __DIR__ . '/bootstrap.php';
+define('CSV_PATH', output_path('whois_orphaned_whm_report.csv'));
 
 // Seconds to wait between lookups. .au domains in particular (auDA's WHOIS
 // registry) rate-limit aggressively and will start returning empty/blocked

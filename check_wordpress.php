@@ -35,13 +35,13 @@
  *   WHM_SOURCE_LABEL=shock-2 WHM_HOST=... WHM_USERNAME=... WHM_API_TOKEN=... php check_wordpress.php
  */
 
-define('WHM_HOST', getenv('WHM_HOST') ?: 'YOUR_SERVER_HOSTNAME');
-define('WHM_PORT', getenv('WHM_PORT') ?: '2087');
-define('WHM_USERNAME', getenv('WHM_USERNAME') ?: 'YOUR_WHM_USERNAME');
-define('WHM_API_TOKEN', getenv('WHM_API_TOKEN') ?: 'YOUR_API_TOKEN');
-define('WHM_SOURCE_LABEL', getenv('WHM_SOURCE_LABEL') ?: (WHM_HOST . ':' . WHM_USERNAME));
-define('DB_PATH', __DIR__ . '/websites.sqlite');
-define('CSV_PATH', __DIR__ . '/wordpress_report_' . WHM_SOURCE_LABEL . '.csv');
+// ---------------------------------------------------------------------
+// CONFIG - identical pattern to sync_whm_accounts.php
+// ---------------------------------------------------------------------
+
+require __DIR__ . '/bootstrap.php';
+define_whm_config();
+define('CSV_PATH', output_path('wordpress_report_' . safe_filename_part(WHM_SOURCE_LABEL) . '.csv'));
 
 // ---------------------------------------------------------------------
 // DB

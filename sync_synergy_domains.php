@@ -25,8 +25,8 @@
 // CONFIG - fill these in, or better, load from environment variables so
 // credentials never end up committed to source control.
 // ---------------------------------------------------------------------
-define('SYNERGY_RESELLER_ID', getenv('SYNERGY_RESELLER_ID') ?: 'YOUR_RESELLER_ID');
-define('SYNERGY_API_KEY',     getenv('SYNERGY_API_KEY')     ?: 'YOUR_API_KEY');
+require __DIR__ . '/bootstrap.php';
+define_synergy_config();
 
 // Synergy's API location per their docs. Their SOAP service exposes a WSDL
 // at this endpoint - if this throws a "could not connect to host" or WSDL
@@ -35,9 +35,8 @@ define('SYNERGY_API_KEY',     getenv('SYNERGY_API_KEY')     ?: 'YOUR_API_KEY');
 // providers occasionally version this path.
 define('SYNERGY_WSDL', 'https://api.synergywholesale.com/?wsdl');
 
-// Where to store the synced data. SQLite keeps this dependency-free; swap
+// DB_PATH comes from bootstrap.php. SQLite keeps this dependency-free; swap
 // for a MySQL PDO DSN later if you want this shared across a team.
-define('DB_PATH', __DIR__ . '/websites.sqlite');
 
 // Synergy caps pages at 500 domains - use the max to minimize round trips
 // for a 400+ domain account (this likely means everything fits on page 1,

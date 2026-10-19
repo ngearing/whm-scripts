@@ -37,12 +37,8 @@
  *   WHM_SOURCE_LABEL=shock-1 WHM_HOST=... WHM_USERNAME=... WHM_API_TOKEN=... php check_error_logs.php
  */
 
-define('WHM_HOST', getenv('WHM_HOST') ?: 'YOUR_SERVER_HOSTNAME');
-define('WHM_PORT', getenv('WHM_PORT') ?: '2087');
-define('WHM_USERNAME', getenv('WHM_USERNAME') ?: 'YOUR_WHM_USERNAME');
-define('WHM_API_TOKEN', getenv('WHM_API_TOKEN') ?: 'YOUR_API_TOKEN');
-define('WHM_SOURCE_LABEL', getenv('WHM_SOURCE_LABEL') ?: (WHM_HOST . ':' . WHM_USERNAME));
-define('DB_PATH', __DIR__ . '/websites.sqlite');
+require __DIR__ . '/bootstrap.php';
+define_whm_config();
 
 // Don't download error_log content past this size - just flag it as too
 // large and let the size column itself signal "this needs a manual look".
@@ -367,7 +363,7 @@ function run(): void {
     }
 
     // CSV export, largest files first - the ones most worth looking at.
-    $csvPath = __DIR__ . '/error_log_report_' . WHM_SOURCE_LABEL . '.csv';
+    $csvPath = output_path('error_log_report_' . safe_filename_part(WHM_SOURCE_LABEL) . '.csv');
     $fh = fopen($csvPath, 'w');
     fputcsv($fh, [
         'domain',

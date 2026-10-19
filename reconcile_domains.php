@@ -34,14 +34,14 @@
  *
  * Output:
  *   - Console summary
- *   - reconciliation_report.csv in the same directory
+ *   - output/reconciliation_report.csv
  *   - A `reconciliation_results` table in websites.sqlite, so this can be
  *     queried directly (e.g. from a future MainWP extension) instead of
  *     re-parsing the CSV
  */
 
-define('DB_PATH', __DIR__ . '/websites.sqlite');
-define('CSV_PATH', __DIR__ . '/reconciliation_report.csv');
+require __DIR__ . '/bootstrap.php';
+define('CSV_PATH', output_path('reconciliation_report.csv'));
 
 // If your Shock nameservers differ from the defaults, update this list -
 // it's used only for the informational DNS mismatch flag below, not for

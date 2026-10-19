@@ -27,6 +27,12 @@
  * touches account 1's data, even if both happen to reuse the same cPanel
  * username somewhere.
  *
+ * Config is read from real environment variables first, falling back to a
+ * .env file sitting next to this script (see bootstrap.php) - so you
+ * can either export WHM_SOURCE_LABEL etc. per invocation as shown above,
+ * or set the shared credentials in .env and just override
+ * WHM_SOURCE_LABEL per run.
+ *
  * Requires:
  *   - PHP cURL extension (bundled with Homebrew's php formula)
  *   - PHP PDO SQLite extension (also bundled)
@@ -36,37 +42,20 @@
  */
 
 // ---------------------------------------------------------------------
-// CONFIG - fill these in, or load from environment variables so
+// CONFIG - loaded by bootstrap.php from the environment / .env file, so
 // credentials never end up committed to source control.
-// ---------------------------------------------------------------------
-
-// The hostname of your Shock Hosting reseller server, e.g. server3.shockhosting.com
-// (find this in your Shock welcome email / WHM login URL).
-define('WHM_HOST', getenv('WHM_HOST') ?: 'YOUR_SERVER_HOSTNAME');
-
-// WHM listens on 2087 for HTTPS API access.
-define('WHM_PORT', getenv('WHM_PORT') ?: '2087');
-
-// The WHM user that owns the API token - for a reseller account this is
-// your reseller username, not "root" (root-level tokens aren't available
-// to reseller-only accounts on shared reseller hosting like Shock).
-define('WHM_USERNAME', getenv('WHM_USERNAME') ?: 'YOUR_WHM_USERNAME');
-
-define('WHM_API_TOKEN', getenv('WHM_API_TOKEN') ?: 'YOUR_API_TOKEN');
-
-// You have more than one Shock reseller account (too many cPanels to fit
-// under one), so every record needs to be tagged with which account it
-// came from - otherwise a username that happens to exist on both accounts
-// would silently overwrite the other's data on re-sync.
 //
-// Set this explicitly per run, e.g. WHM_SOURCE_LABEL=shock-1 and
-// WHM_SOURCE_LABEL=shock-2. If left unset it falls back to
-// "host:username", which is unique enough by default but a plain label is
-// easier to read in reports.
-define('WHM_SOURCE_LABEL', getenv('WHM_SOURCE_LABEL') ?: (WHM_HOST . ':' . WHM_USERNAME));
-
-// Same DB file the Synergy sync writes to, so both tables live together.
-define('DB_PATH', __DIR__ . '/websites.sqlite');
+//   WHM_HOST          your reseller server hostname, e.g. server3.shockhosting.com
+//   WHM_PORT          defaults to 2087 (HTTPS API)
+//   WHM_USERNAME      the reseller username that owns the token (not root)
+//   WHM_API_TOKEN     WHM -> Development -> Manage API Tokens
+//   WHM_SOURCE_LABEL  tags every record with the reseller account it came
+//                     from, so a username that exists on two accounts can't
+//                     overwrite the other's data on re-sync. Set it per run
+//                     (shock-1, shock-2); defaults to "host:username".
+// ---------------------------------------------------------------------
+require __DIR__ . '/bootstrap.php';
+define_whm_config();
 
 // ---------------------------------------------------------------------
 // DB SETUP

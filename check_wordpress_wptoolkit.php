@@ -45,13 +45,9 @@
  * scan is the fallback in that case.
  */
 
-define('WHM_HOST', getenv('WHM_HOST') ?: 'YOUR_SERVER_HOSTNAME');
-define('WHM_PORT', getenv('WHM_PORT') ?: '2087');
-define('WHM_USERNAME', getenv('WHM_USERNAME') ?: 'YOUR_WHM_USERNAME');
-define('WHM_API_TOKEN', getenv('WHM_API_TOKEN') ?: 'YOUR_API_TOKEN');
-define('WHM_SOURCE_LABEL', getenv('WHM_SOURCE_LABEL') ?: (WHM_HOST . ':' . WHM_USERNAME));
-define('DB_PATH', __DIR__ . '/websites.sqlite');
-define('RAW_JSON_LOG_PATH', __DIR__ . '/wp_toolkit_raw_' . WHM_SOURCE_LABEL . '.jsonl');
+require __DIR__ . '/bootstrap.php';
+define_whm_config();
+define('RAW_JSON_LOG_PATH', output_path('wp_toolkit_raw_' . safe_filename_part(WHM_SOURCE_LABEL) . '.jsonl'));
 
 // ---------------------------------------------------------------------
 // DB
@@ -847,7 +843,7 @@ function run(): void {
     fclose($rawLog);
 
     // CSV export - the columns that actually matter for a quick scan.
-    $csvPath = __DIR__ . '/wp_toolkit_report_' . WHM_SOURCE_LABEL . '.csv';
+    $csvPath = output_path('wp_toolkit_report_' . safe_filename_part(WHM_SOURCE_LABEL) . '.csv');
     $fh = fopen($csvPath, 'w');
     fputcsv($fh, [
         'domain',
