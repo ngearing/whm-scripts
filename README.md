@@ -47,6 +47,7 @@ extra API call per account, reads the accounts `sync_whm_accounts.php` stored).
 |---|---|
 | `check_error_logs.php` | error_log sizes/tails per account -> `output/error_log_report_*.csv` |
 | `find_plugin_installs.php <slug>` | where a plugin is installed -> `output/plugin_report_<slug>_*.csv` |
+| `upload_plugin.php` | deploy or remove `plugins/gg-user-protect.php` across WordPress installs (`--dry-run` recommended first) |
 | `find_missing_mailchannels_records.php` | zones missing `_mailchannels` TXT -> `output/missing_mailchannels.csv` |
 | `manage_dns_zone_records.php` | list/add/edit/remove zone records, `bulk-add-csv` (finds files in `output/` by bare name) |
 | `sync_php_versions.php` | PHP version per vhost -> `whm_vhost_php_versions` and `whm_accounts.php_version`. `--user=a,b`, `--limit=N` |
