@@ -35,6 +35,49 @@
  *   WHM_SOURCE_LABEL=shock-2 WHM_HOST=... WHM_USERNAME=... WHM_API_TOKEN=... php check_wordpress.php
  */
 
+// ---------------------------------------------------------------------
+// .ENV LOADER - no Composer/phpdotenv dependency. Reads simple KEY=VALUE
+// lines from a .env file next to this script (override the location with
+// DOTENV_PATH), skipping blanks/comments and stripping surrounding
+// quotes. Never overwrites a variable already set in the real shell
+// environment, so `WHM_API_TOKEN=xxx php script.php` or a CI secret still
+// wins over whatever is in .env.
+// ---------------------------------------------------------------------
+function load_dotenv(string $path): void {
+    if (!file_exists($path)) {
+        return; // no .env file present - fall back to real env / defaults
+    }
+
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+        if ($line === '' || str_starts_with($line, '#') || !str_contains($line, '=')) {
+            continue;
+        }
+
+        [$key, $value] = explode('=', $line, 2);
+        $key = trim($key);
+        $value = trim($value);
+
+        if (strlen($value) >= 2 && (
+            ($value[0] === '"' && $value[-1] === '"') ||
+            ($value[0] === "'" && $value[-1] === "'")
+        )) {
+            $value = substr($value, 1, -1);
+        }
+
+        if (getenv($key) === false) {
+            putenv("{$key}={$value}");
+            $_ENV[$key] = $value;
+        }
+    }
+}
+
+load_dotenv(getenv('DOTENV_PATH') ?: __DIR__ . '/.env');
+
+// ---------------------------------------------------------------------
+// CONFIG - identical pattern to sync_whm_accounts.php
+// ---------------------------------------------------------------------
+
 define('WHM_HOST', getenv('WHM_HOST') ?: 'YOUR_SERVER_HOSTNAME');
 define('WHM_PORT', getenv('WHM_PORT') ?: '2087');
 define('WHM_USERNAME', getenv('WHM_USERNAME') ?: 'YOUR_WHM_USERNAME');
