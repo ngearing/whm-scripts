@@ -22,33 +22,9 @@
  * check_wordpress.php first.
  */
 
-function load_dotenv(string $path): void {
-    if (!is_file($path)) {
-        return;
-    }
-    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
-        $line = trim($line);
-        if ($line === '' || str_starts_with($line, '#')) {
-            continue;
-        }
-        [$key, $value] = array_pad(explode('=', $line, 2), 2, '');
-        $key = trim($key);
-        $value = trim($value, " \t\n\r\0\x0B\"'");
-        if ($key !== '' && getenv($key) === false) {
-            putenv("{$key}={$value}");
-        }
-    }
-}
-
-load_dotenv(__DIR__ . '/.env');
-
-define('WHM_HOST', getenv('WHM_HOST') ?: 'YOUR_SERVER_HOSTNAME');
-define('WHM_PORT', getenv('WHM_PORT') ?: '2087');
-define('WHM_USERNAME', getenv('WHM_USERNAME') ?: 'YOUR_WHM_USERNAME');
-define('WHM_API_TOKEN', getenv('WHM_API_TOKEN') ?: 'YOUR_API_TOKEN');
-define('WHM_SOURCE_LABEL', getenv('WHM_SOURCE_LABEL') ?: (WHM_HOST . ':' . WHM_USERNAME));
-define('DB_PATH', __DIR__ . '/websites.sqlite');
-define('CSV_PATH', __DIR__ . '/woocommerce_report_' . WHM_SOURCE_LABEL . '.csv');
+require __DIR__ . '/bootstrap.php';
+define_whm_config();
+define('CSV_PATH', output_path('woocommerce_report_' . safe_filename_part(WHM_SOURCE_LABEL) . '.csv'));
 
 // ---------------------------------------------------------------------
 // DB

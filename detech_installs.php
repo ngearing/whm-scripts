@@ -1,7 +1,7 @@
 <?php
 
 /**
- * detect_new_installs.php
+ * detech_installs.php
  *
  * First piece of the "auto-install MainWP child on new installs" objective.
  * This script does ONLY detection - it does not install anything or touch
@@ -23,15 +23,15 @@
  * first run as establishing a baseline, not a list of things to act on.
  *
  * Usage:
- *   WHM_SOURCE_LABEL=shock-1 php detect_new_installs.php
+ *   WHM_SOURCE_LABEL=shock-1 php detech_installs.php
  *
  * Run this after sync_whm_accounts.php and check_wordpress_wptoolkit.php
  * (or check_wordpress.php) have completed for the source. Doesn't need
  * WHM credentials itself - it only reads from the local database.
  */
 
-define('WHM_SOURCE_LABEL', getenv('WHM_SOURCE_LABEL') ?: 'YOUR_SOURCE_LABEL');
-define('DB_PATH', __DIR__ . '/websites.sqlite');
+require __DIR__ . '/bootstrap.php';
+define_source_label();
 
 function get_db(): PDO {
     $pdo = new PDO('sqlite:' . DB_PATH);
