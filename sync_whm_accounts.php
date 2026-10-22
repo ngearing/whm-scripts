@@ -7,10 +7,16 @@
  * reseller account (whmapi1 `listaccts`), plus - per account, via the
  * `uapi_cpanel` proxy running UAPI functions as that cPanel user (since
  * reseller ACLs typically don't grant the top-level whmapi1 equivalents) -
- * the PHP version per vhost (LangPHP::php_get_vhost_versions) and the full
- * domain inventory: main, addon, and parked domains (DomainInfo::list_domains).
- * All three are stored into the same local SQLite database used by
- * sync_synergy_domains.php.
+ * the full domain inventory: main, addon, and parked domains
+ * (DomainInfo::list_domains). Both are stored into the same local SQLite
+ * database used by sync_synergy_domains.php.
+ *
+ * PHP versions are NOT fetched here any more - that was a second API call
+ * per account and made this sync twice as slow, and nothing in the
+ * reconciliation pipeline needs it. Run sync_php_versions.php when you want
+ * them. Whatever it stored previously (whm_accounts.php_version and
+ * whm_vhost_php_versions) is left in place by this script, apart from rows
+ * for accounts that no longer exist.
  *
  * This is step 2 of the reconciliation pipeline: "Pull domains from Shock
  * and match up cPanel installs". Once both sync scripts have run, a third
@@ -56,6 +62,7 @@
 // ---------------------------------------------------------------------
 require __DIR__ . '/bootstrap.php';
 define_whm_config();
+require __DIR__ . '/lib/whm.php'; // whm_api_call()
 
 // ---------------------------------------------------------------------
 // DB SETUP
@@ -122,7 +129,8 @@ function get_db(): PDO {
 
     // Separate table since php_get_vhost_versions reports per-vhost, and a
     // single cPanel account can have multiple vhosts (addon domains) each
-    // running a different PHP version.
+    // running a different PHP version. Filled by sync_php_versions.php; it is
+    // created here so every script that opens the DB sees the same schema.
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS whm_vhost_php_versions (
             vhost            TEXT,
@@ -159,74 +167,17 @@ function get_db(): PDO {
 }
 
 /**
- * Wipes only this WHM source's prior rows from all three tables, so a
- * re-sync of one reseller account never touches the other's data and
- * correctly drops accounts/domains that were removed since the last sync
- * of THIS source.
+ * Wipes only this WHM source's prior whm_domains rows, so a re-sync of one
+ * reseller account never touches the other's data and correctly drops
+ * domains that were removed since the last sync of THIS source.
+ *
+ * whm_accounts is upserted instead (see sync_whm_accounts()) so the
+ * php_version that sync_php_versions.php stored survives, and
+ * whm_vhost_php_versions is owned by sync_php_versions.php entirely.
  */
-function clear_existing_source_data(PDO $pdo, string $source): void {
-    $pdo->prepare("DELETE FROM whm_accounts WHERE whm_source = :source")
-        ->execute([':source' => $source]);
-    $pdo->prepare("DELETE FROM whm_vhost_php_versions WHERE whm_source = :source")
-        ->execute([':source' => $source]);
+function clear_existing_source_domains(PDO $pdo, string $source): void {
     $pdo->prepare("DELETE FROM whm_domains WHERE whm_source = :source")
         ->execute([':source' => $source]);
-}
-
-// ---------------------------------------------------------------------
-// WHM API HELPER
-// ---------------------------------------------------------------------
-/**
- * Calls a whmapi1 function over HTTPS and returns the decoded JSON body.
- *
- * @param string $function WHM API 1 function name, e.g. 'listaccts'
- * @param array  $params   Extra query parameters for the call
- * @return array Decoded JSON response
- * @throws RuntimeException on transport or HTTP-level failure
- */
-function whm_api_call(string $function, array $params = []): array {
-    $params['api.version'] = 1;
-    $url = sprintf(
-        'https://%s:%s/json-api/%s?%s',
-        WHM_HOST,
-        WHM_PORT,
-        $function,
-        http_build_query($params)
-    );
-
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER     => [
-            'Authorization: whm ' . WHM_USERNAME . ':' . WHM_API_TOKEN,
-        ],
-        CURLOPT_TIMEOUT        => 60,
-        // Shock's WHM servers use valid certs, so we leave SSL verification
-        // on. If you're testing against a self-signed dev box, this is the
-        // (not recommended) knob to flip off temporarily.
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2,
-    ]);
-
-    $body = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curlError = curl_error($ch);
-    curl_close($ch);
-
-    if ($body === false) {
-        throw new RuntimeException("cURL error calling {$function}: {$curlError}");
-    }
-
-    if ($httpCode !== 200) {
-        throw new RuntimeException("HTTP {$httpCode} calling {$function}: " . substr($body, 0, 300));
-    }
-
-    $decoded = json_decode($body, true);
-    if ($decoded === null) {
-        throw new RuntimeException("Failed to decode JSON response from {$function}");
-    }
-
-    return $decoded;
 }
 
 // ---------------------------------------------------------------------
@@ -246,22 +197,32 @@ function sync_whm_accounts(PDO $pdo, string $syncedAt): array {
     $accounts = $response['data']['acct'] ?? [];
     echo "Received " . count($accounts) . " accounts.\n";
 
-    // Only clear this source's own prior rows - the other reseller
-    // account's data (if already synced) is untouched.
-    clear_existing_source_data($pdo, WHM_SOURCE_LABEL);
-
-    $insert = $pdo->prepare("
+    // Upsert rather than delete+insert, so php_version (filled in separately
+    // by sync_php_versions.php) survives. It is reset only if the account's
+    // primary domain changed, since the stored version belonged to the old one.
+    $upsert = $pdo->prepare("
         INSERT INTO whm_accounts
             (username, whm_source, domain, plan, ip, disklimit, diskused,
              suspended, suspend_reason, last_synced_at)
         VALUES
             (:username, :whm_source, :domain, :plan, :ip, :disklimit, :diskused,
              :suspended, :suspend_reason, :last_synced_at)
+        ON CONFLICT (username, whm_source) DO UPDATE SET
+            php_version    = CASE WHEN whm_accounts.domain IS excluded.domain
+                                  THEN whm_accounts.php_version ELSE NULL END,
+            domain         = excluded.domain,
+            plan           = excluded.plan,
+            ip             = excluded.ip,
+            disklimit      = excluded.disklimit,
+            diskused       = excluded.diskused,
+            suspended      = excluded.suspended,
+            suspend_reason = excluded.suspend_reason,
+            last_synced_at = excluded.last_synced_at
     ");
 
     $pdo->beginTransaction();
     foreach ($accounts as $acct) {
-        $insert->execute([
+        $upsert->execute([
             ':username'       => $acct['user'] ?? null,
             ':whm_source'     => WHM_SOURCE_LABEL,
             ':domain'         => $acct['domain'] ?? null,
@@ -274,47 +235,40 @@ function sync_whm_accounts(PDO $pdo, string $syncedAt): array {
             ':last_synced_at' => $syncedAt,
         ]);
     }
+
+    // Every account still on the reseller was just stamped with $syncedAt, so
+    // anything from this source with an older stamp has been removed.
+    $pdo->prepare("DELETE FROM whm_accounts WHERE whm_source = :source AND last_synced_at <> :t")
+        ->execute([':source' => WHM_SOURCE_LABEL, ':t' => $syncedAt]);
+
+    // ...and drop stored PHP versions that belonged to those removed accounts.
+    $pdo->prepare("
+        DELETE FROM whm_vhost_php_versions
+        WHERE whm_source = :source
+          AND account NOT IN (SELECT username FROM whm_accounts WHERE whm_source = :source2)
+    ")->execute([':source' => WHM_SOURCE_LABEL, ':source2' => WHM_SOURCE_LABEL]);
     $pdo->commit();
 
     return $accounts;
 }
 
 // ---------------------------------------------------------------------
-// SYNC: PHP VERSIONS PER VHOST
+// SYNC: DOMAIN INVENTORY PER ACCOUNT
 // ---------------------------------------------------------------------
 /**
- * On reseller-scoped WHM accounts (like Shock's reseller plans), the
- * top-level `whmapi1 php_get_vhost_versions` function is often outside the
- * reseller's ACL. The reliable path is to proxy a UAPI call through WHM as
- * the specific cPanel user via the `uapi_cpanel` function - this borrows
- * that cPanel user's own permissions instead of requiring reseller-level
- * PHP management rights. This mirrors the working Node.js implementation.
+ * On reseller-scoped WHM accounts the top-level whmapi1 equivalents are
+ * often outside the reseller's ACL. The reliable path is to proxy a UAPI
+ * call through WHM as the specific cPanel user via the `uapi_cpanel`
+ * function - this borrows that cPanel user's own permissions.
  *
  * Because this call is scoped to one cPanel user at a time, it has to run
- * once per account rather than as a single bulk call - expect this to take
- * a while longer at 400+ accounts (roughly one HTTP round trip per site).
+ * once per account rather than as a single bulk call - roughly one HTTP
+ * round trip per site.
  */
-function get_php_versions_for_account(string $username, string $primaryDomain): array {
-    $params = [
-        'cpanel.user'     => $username,
-        'cpanel.module'   => 'LangPHP',
-        'cpanel.function' => 'php_get_vhost_versions',
-    ];
-
-    $response = whm_api_call('uapi_cpanel', $params);
-
-    $vhostList = $response['data']['uapi']['data'] ?? [];
-    if (!is_array($vhostList)) {
-        $vhostList = [];
-    }
-
-    return $vhostList; // array of ['vhost' => ..., 'version' => ...]
-}
-
 /**
  * Fetches the full domain inventory (main, addon, parked) for one cPanel
  * account via DomainInfo::list_domains, proxied through uapi_cpanel the
- * same way as the PHP version lookup above.
+ * same way as the other per-account lookups.
  *
  * @return array{main: ?string, addon: string[], parked: string[]}
  */
@@ -342,26 +296,16 @@ function get_domains_for_account(string $username): array {
  * @param array $accounts The account rows returned from listaccts (needs
  *                         'user' and 'domain' keys per entry)
  */
-function sync_account_details(PDO $pdo, string $syncedAt, array $accounts): array {
-    echo "Fetching PHP versions and full domain inventory per account (uapi_cpanel)...\n";
-    echo "This loops two calls per account, so it's the slowest step - grab a coffee.\n";
+function sync_account_domains(PDO $pdo, string $syncedAt, array $accounts): array {
+    echo "Fetching full domain inventory per account (uapi_cpanel)...\n";
 
-    $insertVhost = $pdo->prepare("
-        INSERT INTO whm_vhost_php_versions (vhost, whm_source, account, php_version, last_synced_at)
-        VALUES (:vhost, :whm_source, :account, :php_version, :last_synced_at)
-    ");
-
-    $updateAcctPhp = $pdo->prepare("
-        UPDATE whm_accounts SET php_version = :php_version
-        WHERE username = :username AND whm_source = :whm_source
-    ");
+    clear_existing_source_domains($pdo, WHM_SOURCE_LABEL);
 
     $insertDomain = $pdo->prepare("
         INSERT INTO whm_domains (domain, whm_source, account, domain_type, last_synced_at)
         VALUES (:domain, :whm_source, :account, :domain_type, :last_synced_at)
     ");
 
-    $totalVhosts = 0;
     $totalDomains = 0;
     $errorCount = 0;
     $i = 0;
@@ -375,30 +319,6 @@ function sync_account_details(PDO $pdo, string $syncedAt, array $accounts): arra
             continue;
         }
 
-        // --- PHP versions ---
-        try {
-            $vhostList = get_php_versions_for_account($username, $domain);
-        } catch (Throwable $e) {
-            fwrite(STDERR, "  [{$username}] PHP version lookup failed: " . $e->getMessage() . "\n");
-            $vhostList = [];
-            $errorCount++;
-        }
-
-        $primaryVersion = 'Not Defined';
-        $primaryVhostEntry = null;
-        foreach ($vhostList as $v) {
-            if (($v['vhost'] ?? null) === $domain) {
-                $primaryVhostEntry = $v;
-                break;
-            }
-        }
-        if ($primaryVhostEntry === null && count($vhostList) > 0) {
-            $primaryVhostEntry = $vhostList[0];
-        }
-        if ($primaryVhostEntry !== null) {
-            $primaryVersion = $primaryVhostEntry['version'] ?? 'Not Defined';
-        }
-
         // --- Domain inventory (main / addon / parked) ---
         try {
             $domainInfo = get_domains_for_account($username);
@@ -407,38 +327,6 @@ function sync_account_details(PDO $pdo, string $syncedAt, array $accounts): arra
             $domainInfo = ['main' => $domain, 'addon' => [], 'parked' => []];
             $errorCount++;
         }
-
-        $pdo->beginTransaction();
-
-        foreach ($vhostList as $v) {
-            $vhost = $v['vhost'] ?? null;
-            $version = $v['version'] ?? null;
-            if ($vhost === null) {
-                continue;
-            }
-            try {
-                $insertVhost->execute([
-                    ':vhost'          => $vhost,
-                    ':whm_source'     => WHM_SOURCE_LABEL,
-                    ':account'        => $username,
-                    ':php_version'    => $version,
-                    ':last_synced_at' => $syncedAt,
-                ]);
-                $totalVhosts++;
-            } catch (PDOException $e) {
-                // Same vhost claimed twice within this one source - flag it
-                // rather than silently dropping or overwriting, since two
-                // accounts on the same reseller both claiming the same
-                // domain is a genuine account hygiene problem.
-                fwrite(STDERR, "  WARNING: vhost '{$vhost}' already claimed by another account in source '" . WHM_SOURCE_LABEL . "' - skipping duplicate from '{$username}'\n");
-            }
-        }
-
-        $updateAcctPhp->execute([
-            ':php_version' => $primaryVersion,
-            ':username'    => $username,
-            ':whm_source'  => WHM_SOURCE_LABEL,
-        ]);
 
         $mainDomain = $domainInfo['main'] ?? $domain;
         $domainsToInsert = [];
@@ -452,6 +340,7 @@ function sync_account_details(PDO $pdo, string $syncedAt, array $accounts): arra
             $domainsToInsert[] = [$parkedDomain, 'parked'];
         }
 
+        $pdo->beginTransaction();
         foreach ($domainsToInsert as [$domainName, $domainType]) {
             try {
                 $insertDomain->execute([
@@ -463,10 +352,13 @@ function sync_account_details(PDO $pdo, string $syncedAt, array $accounts): arra
                 ]);
                 $totalDomains++;
             } catch (PDOException $e) {
+                // Same domain claimed twice within this one source - flag it
+                // rather than silently dropping or overwriting, since two
+                // accounts on the same reseller both claiming the same
+                // domain is a genuine account hygiene problem.
                 fwrite(STDERR, "  WARNING: domain '{$domainName}' already claimed by another account in source '" . WHM_SOURCE_LABEL . "' - skipping duplicate from '{$username}'\n");
             }
         }
-
         $pdo->commit();
 
         if ($i % 25 === 0) {
@@ -478,10 +370,9 @@ function sync_account_details(PDO $pdo, string $syncedAt, array $accounts): arra
         usleep(150000); // 0.15s
     }
 
-    echo "Account detail sync complete. {$totalVhosts} vhost PHP records, "
-        . "{$totalDomains} domain records (main+addon+parked), {$errorCount} lookups failed.\n";
+    echo "Domain sync complete. {$totalDomains} domain records (main+addon+parked), {$errorCount} lookups failed.\n";
 
-    return ['vhosts' => $totalVhosts, 'domains' => $totalDomains, 'errors' => $errorCount];
+    return ['domains' => $totalDomains, 'errors' => $errorCount];
 }
 
 // ---------------------------------------------------------------------
@@ -492,13 +383,13 @@ try {
     $syncedAt = date('c');
 
     $accounts = sync_whm_accounts($pdo, $syncedAt);
-    $details = sync_account_details($pdo, $syncedAt, $accounts);
+    $details = sync_account_domains($pdo, $syncedAt, $accounts);
 
     echo "\nDone. (source: " . WHM_SOURCE_LABEL . ")\n";
     echo "  Accounts synced: " . count($accounts) . "\n";
-    echo "  PHP version records synced: {$details['vhosts']}\n";
     echo "  Domain records synced (main+addon+parked): {$details['domains']}\n";
-    echo "Data stored in " . DB_PATH . " (tables: whm_accounts, whm_vhost_php_versions, whm_domains)\n";
+    echo "Data stored in " . DB_PATH . " (tables: whm_accounts, whm_domains)\n";
+    echo "PHP versions are not synced here - run sync_php_versions.php when you need them.\n";
 } catch (Throwable $e) {
     fwrite(STDERR, "Error: " . $e->getMessage() . "\n");
     exit(1);

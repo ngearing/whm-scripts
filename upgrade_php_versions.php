@@ -36,7 +36,7 @@
  *     back in WHM -> MultiPHP Manager).
  *   - Successful changes are also written back to websites.sqlite
  *     (whm_vhost_php_versions / whm_accounts) so reports stay in step until
- *     the next sync_whm_accounts.php run.
+ *     the next sync_php_versions.php run.
  *
  * Credentials come from .env / the environment (see bootstrap.php).
  */

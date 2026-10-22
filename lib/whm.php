@@ -20,7 +20,11 @@ if (!function_exists('whm_api_call')) {
      * form body instead - needed for uapi_cpanel write operations.
      */
     function whm_api_call(string $function, array $params = [], ?array $post = null): array {
-        $params['api.version'] = 1;
+        // The `cpanel` function (API2 proxy) is not a whmapi1 call and does not
+        // take api.version; every other function here is whmapi1.
+        if ($function !== 'cpanel') {
+            $params['api.version'] = 1;
+        }
         $url = sprintf(
             'https://%s:%s/json-api/%s?%s',
             WHM_HOST,
