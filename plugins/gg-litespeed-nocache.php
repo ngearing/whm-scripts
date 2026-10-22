@@ -3,7 +3,7 @@
 /**
  * Plugin Name: GG - LiteSpeed Cache Rules
  * Description: Never caches pages that render a Gravity Form, never caches password-protected or private WordPress pages, and forces the LiteSpeed public TTL to 8 hours.
- * Version: 1.1
+ * Version: 1.2
  */
 
 if (! defined('ABSPATH')) {
@@ -12,12 +12,21 @@ if (! defined('ABSPATH')) {
 
 /**
  * 1. Mark any page that renders a Gravity Form as non-cacheable.
+ *
+ * gform_pre_render is a FILTER: it must return $form or the form disappears
+ * ("Oops! We could not locate your form.").
  */
-function gfls_nocache_form_page() {
+function gfls_nocache_form_filter($form) {
+	do_action('litespeed_control_set_nocache', 'Gravity Form on page');
+	return $form;
+}
+add_filter('gform_pre_render', 'gfls_nocache_form_filter', 1);
+
+// gform_enqueue_scripts is an action, so no return value is needed.
+function gfls_nocache_form_action() {
 	do_action('litespeed_control_set_nocache', 'Gravity Form on page');
 }
-add_action('gform_pre_render', 'gfls_nocache_form_page');
-add_action('gform_enqueue_scripts', 'gfls_nocache_form_page');
+add_action('gform_enqueue_scripts', 'gfls_nocache_form_action');
 
 /**
  * 2. Never cache password-protected or private (post status) pages/posts.
